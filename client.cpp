@@ -9,6 +9,7 @@
 #include <sstream>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -19,9 +20,10 @@ std::string CLIENT_LOG;
 int sock = 0;
 std::atomic<bool> running(true);
 
-std::string my_username; // ИСПРАВЛЕНО: Переменная стала глобальной для доступа из потока чтения
+std::string my_username;
 std::string active_chat_partner = "";
 std::string active_group = "";
+std::string pending_group = ""; // Для проверки прав доступа к группе перед отрисовкой UI
 std::mutex stateMutex;
 
 #define COLOR_YELLOW  "\033[33m"
@@ -35,8 +37,158 @@ bool sendCommand(const std::string& cmd) {
     return sent > 0;
 }
 
+void processIncomingPacket(const std::string& data) {
+    std::istringstream iss(data);
+    std::string cmd;
+    std::getline(iss, cmd, '|');
+
+    bool need_display_update = false;
+    std::string output_to_print = "";
+
+    if (cmd == CMD_INMSG) {
+        std::string from, msg;
+        std::getline(iss, from, '|');
+        std::getline(iss, msg);
+
+        stateMutex.lock();
+        std::string current_partner = active_chat_partner;
+        stateMutex.unlock();
+
+        if (from == current_partner) {
+            output_to_print = "[" + from + "]: " + msg;
+        }
+        else {
+            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: ЛС от " + from + ": " + msg + COLOR_RESET;
+        }
+        logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
+        need_display_update = true;
+    }
+    else if (cmd == CMD_GROUP_MSG) {
+        std::string gname, from, msg;
+        std::getline(iss, gname, '|');
+        std::getline(iss, from, '|');
+        std::getline(iss, msg);
+
+        stateMutex.lock();
+        std::string current_group = active_group;
+        stateMutex.unlock();
+
+        if (gname == current_group) {
+            output_to_print = "[" + from + "]: " + msg;
+        }
+        else {
+            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Новое в " + gname + " от " + from + ": " + msg + COLOR_RESET;
+        }
+        logMessage(CLIENT_LOG, "G_IN", "[" + gname + "] " + from + ": " + msg);
+        need_display_update = true;
+    }
+    else if (cmd == CMD_HIST_LINE) {
+        std::string type;
+        std::getline(iss, type, '|');
+        if (type == "PM") {
+            std::string from, msg;
+            std::getline(iss, from, '|');
+            std::getline(iss, msg);
+            output_to_print = "[" + from + "]: " + msg;
+            need_display_update = true;
+        }
+        else if (type == "GROUP") {
+            std::string gname, from, msg;
+            std::getline(iss, gname, '|');
+            std::getline(iss, from, '|');
+            std::getline(iss, msg);
+            output_to_print = "[" + from + "]: " + msg;
+            need_display_update = true;
+        }
+    }
+    else if (cmd == CMD_GROUP_NOTIFY) {
+        std::string type, gname;
+        std::getline(iss, type, '|');
+        std::getline(iss, gname, '|');
+
+        stateMutex.lock();
+        if (type == "KICKED") {
+            std::string admin;
+            std::getline(iss, admin);
+            if (active_group == gname) {
+                active_group = "";
+                // Фикс цвета: COLOR_RESET сдвинут до полосы разделителя
+                output_to_print = std::string(COLOR_RED) + "\n[Вы были удалены из группы " + gname + " администратором " + admin + "]" + COLOR_RESET + "\n========================================";
+            }
+            else {
+                output_to_print = std::string(COLOR_RED) + "[Уведомление]: Администратор " + admin + " удалил вас из группы " + gname + COLOR_RESET;
+            }
+            need_display_update = true;
+        }
+        else if (type == "DELETED") {
+            if (active_group == gname) {
+                active_group = "";
+                // Фикс цвета полосы
+                output_to_print = std::string(COLOR_RED) + "\n[Группа " + gname + " была удалена администратором]" + COLOR_RESET + "\n========================================";
+            }
+            else {
+                output_to_print = std::string(COLOR_RED) + "[Уведомление]: Группа " + gname + " удалена администратором." + COLOR_RESET;
+            }
+            need_display_update = true;
+        }
+        else if (type == "ADDED") {
+            std::string admin;
+            std::getline(iss, admin);
+            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Администратор " + admin + " добавил вас в группу " + gname + " (Теперь вы можете войти в неё)" + COLOR_RESET;
+            need_display_update = true;
+        }
+        stateMutex.unlock();
+    }
+    else if (cmd == CMD_OK) {
+        std::string info;
+        std::getline(iss, info);
+        if (info.find("Goodbye") != std::string::npos) return;
+
+        stateMutex.lock();
+        // Отрисовка шапки только при реальном и успешном входе в группу
+        if (!pending_group.empty() && (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
+            active_group = pending_group;
+            std::string gname = active_group;
+            pending_group = "";
+            stateMutex.unlock();
+
+            output_to_print = "\n========================================\n Групповой чат: " + gname + "\n========================================\nКоманды админа: /add <имя>, /delete <имя>, /delete_group\nДля выхода введите /exit\n";
+            need_display_update = true;
+        }
+        else {
+            stateMutex.unlock();
+            if (info != "Message sent" && info != "Group message sent") {
+                output_to_print = COLOR_YELLOW + std::string("[Server]: ") + info + COLOR_RESET;
+                need_display_update = true;
+            }
+        }
+        logMessage(CLIENT_LOG, "INFO", info);
+    }
+    else if (cmd == CMD_ERROR) {
+        std::string err;
+        std::getline(iss, err);
+        output_to_print = COLOR_RED + std::string("[Error]: ") + err + COLOR_RESET;
+        need_display_update = true;
+
+        stateMutex.lock();
+        pending_group = ""; // Сбрасываем попытку входа при ошибке
+        if (!active_group.empty()) {
+            active_group = "";
+        }
+        stateMutex.unlock();
+    }
+
+    if (need_display_update && running) {
+        std::cout << "\r\033[K" << output_to_print << std::endl;
+        rl_on_new_line();
+        rl_redisplay();
+    }
+}
+
 void* receiveThread(void*) {
     char buffer[BUFFER_SIZE];
+    std::string stream_buffer = "";
+
     while (running) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
@@ -48,113 +200,16 @@ void* receiveThread(void*) {
             break;
         }
 
-        std::string data(buffer);
-        std::istringstream iss(data);
-        std::string cmd;
-        std::getline(iss, cmd, '|');
+        stream_buffer += std::string(buffer, bytes);
+        size_t pos;
+        while ((pos = stream_buffer.find('\n')) != std::string::npos) {
+            std::string packet = stream_buffer.substr(0, pos);
+            stream_buffer.erase(0, pos + 1);
 
-        bool need_display_update = false;
-        std::string output_to_print = "";
-
-        if (cmd == CMD_INMSG) {
-            std::string from, msg;
-            std::getline(iss, from, '|');
-            std::getline(iss, msg);
-
-            stateMutex.lock();
-            std::string current_partner = active_chat_partner;
-            stateMutex.unlock();
-
-            if (from == current_partner) {
-                output_to_print = "[" + from + "]: " + msg;
+            packet.erase(std::remove(packet.begin(), packet.end(), '\r'), packet.end());
+            if (!packet.empty()) {
+                processIncomingPacket(packet);
             }
-            else {
-                output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: ЛС от " + from + ": " + msg + COLOR_RESET;
-            }
-            logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
-            need_display_update = true;
-        }
-        else if (cmd == CMD_GROUP_MSG) {
-            std::string gname, from, msg;
-            std::getline(iss, gname, '|');
-            std::getline(iss, from, '|');
-            std::getline(iss, msg);
-
-            stateMutex.lock();
-            std::string current_group = active_group;
-            stateMutex.unlock();
-
-            if (gname == current_group) {
-                output_to_print = "[" + from + "]: " + msg;
-            }
-            else {
-                output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Новое в " + gname + " от " + from + ": " + msg + COLOR_RESET;
-            }
-            logMessage(CLIENT_LOG, "G_IN", "[" + gname + "] " + from + ": " + msg);
-            need_display_update = true;
-        }
-        else if (cmd == CMD_GROUP_NOTIFY) {
-            std::string type, gname;
-            std::getline(iss, type, '|');
-            std::getline(iss, gname, '|');
-
-            stateMutex.lock();
-            // ИСПРАВЛЕНО: Теперь принудительно и мгновенно меняем промт readline на базовый
-            if (type == "KICKED" && active_group == gname) {
-                active_group = "";
-                output_to_print = std::string(COLOR_RED) + "\n[Вы были удалены из группы " + gname + "]\n========================================" + COLOR_RESET;
-                need_display_update = true;
-
-                std::string fallback_prompt = "[" + my_username + "]: ";
-                rl_set_prompt(fallback_prompt.c_str());
-            }
-            else if (type == "DELETED" && active_group == gname) {
-                active_group = "";
-                output_to_print = std::string(COLOR_RED) + "\n[Группа " + gname + " была удалена администратором]\n========================================" + COLOR_RESET;
-                need_display_update = true;
-
-                std::string fallback_prompt = "[" + my_username + "]: ";
-                rl_set_prompt(fallback_prompt.c_str());
-            }
-            else if (type == "ADDED") {
-                std::string admin;
-                std::getline(iss, admin);
-                output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Администратор " + admin + " добавил вас в группу " + gname + " (Теперь вы можете войти в неё)" + COLOR_RESET;
-                need_display_update = true;
-            }
-            stateMutex.unlock();
-        }
-        else if (cmd == CMD_OK) {
-            std::string info;
-            std::getline(iss, info);
-            if (info.find("Goodbye") != std::string::npos) continue;
-
-            if (info != "Message sent" && info != "Group message sent" && info != "Joined group.") {
-                output_to_print = COLOR_YELLOW + std::string("[Server]: ") + info + COLOR_RESET;
-                need_display_update = true;
-            }
-            logMessage(CLIENT_LOG, "INFO", info);
-        }
-        else if (cmd == CMD_ERROR) {
-            std::string err;
-            std::getline(iss, err);
-            output_to_print = COLOR_RED + std::string("[Error]: ") + err + COLOR_RESET;
-            need_display_update = true;
-
-            // Если сервер вернул ошибку входа в группу, сбрасываем контекст группы
-            stateMutex.lock();
-            if (!active_group.empty()) {
-                active_group = "";
-                std::string fallback_prompt = "[" + my_username + "]: ";
-                rl_set_prompt(fallback_prompt.c_str());
-            }
-            stateMutex.unlock();
-        }
-
-        if (need_display_update && running) {
-            std::cout << "\r\033[K" << output_to_print << std::endl;
-            rl_on_new_line();
-            rl_redisplay();
         }
     }
     return nullptr;
@@ -221,20 +276,9 @@ int main() {
     pthread_create(&recv_thread, NULL, receiveThread, NULL);
     using_history();
 
-    while (running) {
-        std::string prompt;
-        stateMutex.lock();
-        if (!active_chat_partner.empty()) {
-            prompt = "[" + my_username + " -> " + active_chat_partner + "]: ";
-        }
-        else if (!active_group.empty()) {
-            prompt = "[" + my_username + " @ " + active_group + "]: ";
-        }
-        else {
-            prompt = "[" + my_username + "]: ";
-        }
-        stateMutex.unlock();
+    std::string prompt = "[" + my_username + "]: ";
 
+    while (running) {
         char* line = readline(prompt.c_str());
         if (!line) break;
         std::string input(line);
@@ -303,6 +347,8 @@ int main() {
                 active_chat_partner = target;
                 stateMutex.unlock();
                 std::cout << "\033[A\r\033[K\n========================================\n Чат с: " << target << "\n========================================\nДля выхода введите /exit\n" << std::endl;
+
+                sendCommand(CMD_REQ_HISTORY + "|PM|" + target);
             }
             else if (input.rfind("/group ", 0) == 0) {
                 std::string gname = input.substr(7);
@@ -310,10 +356,14 @@ int main() {
                     std::cout << "\033[A\r\033[K" << COLOR_RED << "[Ошибка]: Имя группы должно начинаться с '#'" << COLOR_RESET << std::endl;
                     continue;
                 }
+
+                // Стираем пользовательский ввод, но UI пока не рисуем
+                std::cout << "\033[A\r\033[K" << std::flush;
+
                 stateMutex.lock();
-                active_group = gname;
+                pending_group = gname; // Запоминаем, куда ломимся
                 stateMutex.unlock();
-                std::cout << "\033[A\r\033[K\n========================================\n Групповой чат: " << gname << "\n========================================\nКоманды админа: /add <имя>, /delete <имя>, /delete_group\nДля выхода введите /exit\n" << std::endl;
+
                 sendCommand(CMD_GROUP_JOIN + "|" + gname);
             }
             else {

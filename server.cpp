@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <fstream>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,6 +18,8 @@
 #include "logger.h"
 
 const std::string SERVER_LOG = "server.log";
+const std::string GROUPS_CONFIG_FILE = "groups_config.txt";
+
 std::map<int, std::string> clients;
 
 struct Group {
@@ -36,10 +39,297 @@ void handle_sigint(int) {
     }
 }
 
+std::string getPMFilename(std::string u1, std::string u2) {
+    if (u1 > u2) std::swap(u1, u2);
+    return "history_pm_" + u1 + "_" + u2 + ".txt";
+}
+
+std::string getGroupFilename(std::string gname) {
+    if (!gname.empty() && gname[0] == '#') {
+        return "history_group_" + gname.substr(1) + ".txt";
+    }
+    return "history_group_" + gname + ".txt";
+}
+
+void saveGroupsConfig() {
+    std::ofstream f(GROUPS_CONFIG_FILE);
+    if (!f.is_open()) return;
+    for (const auto& pair : groups) {
+        f << pair.first << "|" << pair.second.admin << "|";
+        bool first = true;
+        for (const auto& m : pair.second.members) {
+            if (!first) f << ",";
+            f << m;
+            first = false;
+        }
+        f << "\n";
+    }
+}
+
+void loadGroupsConfig() {
+    std::ifstream f(GROUPS_CONFIG_FILE);
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string gname, admin, mems;
+        if (std::getline(iss, gname, '|') && std::getline(iss, admin, '|')) {
+            Group g;
+            g.admin = admin;
+            if (std::getline(iss, mems)) {
+                std::istringstream memiss(mems);
+                std::string member;
+                while (std::getline(memiss, member, ',')) {
+                    if (!member.empty()) g.members.insert(member);
+                }
+            }
+            groups[gname] = g;
+        }
+    }
+    std::cout << "[Server] Loaded " << groups.size() << " groups from backup file." << std::endl;
+}
+
+void appendPMHistory(const std::string& u1, const std::string& u2, const std::string& sender, const std::string& msg) {
+    std::ofstream f(getPMFilename(u1, u2), std::ios::app);
+    if (f.is_open()) {
+        f << sender << "|" << msg << "\n";
+    }
+}
+
+void appendGroupHistory(const std::string& gname, const std::string& sender, const std::string& msg) {
+    std::ofstream f(getGroupFilename(gname), std::ios::app);
+    if (f.is_open()) {
+        f << sender << "|" << msg << "\n";
+    }
+}
+
 bool sendToClient(int sock, const std::string& message) {
     std::string msg = message + "\n";
     int sent = send(sock, msg.c_str(), msg.length(), 0);
     return sent > 0;
+}
+
+void sendPMHistoryToClient(int client_sock, const std::string& u1, const std::string& u2) {
+    std::ifstream f(getPMFilename(u1, u2));
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty()) sendToClient(client_sock, CMD_HIST_LINE + "|PM|" + line);
+    }
+}
+
+void sendGroupHistoryToClient(int client_sock, const std::string& gname) {
+    std::ifstream f(getGroupFilename(gname));
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty()) sendToClient(client_sock, CMD_HIST_LINE + "|GROUP|" + gname + "|" + line);
+    }
+}
+
+void processClientCommand(int client_sock, const std::string& data) {
+    std::istringstream iss(data);
+    std::string cmd;
+    std::getline(iss, cmd, '|');
+
+    if (cmd == CMD_LOGIN) {
+        std::string name;
+        std::getline(iss, name);
+
+        stateMtx.lock();
+        bool nameExists = false;
+        for (auto& p : clients) {
+            if (p.second == name) {
+                nameExists = true;
+                break;
+            }
+        }
+        if (nameExists) {
+            sendToClient(client_sock, CMD_ERROR + "|Username already taken");
+        }
+        else {
+            clients[client_sock] = name;
+            sendToClient(client_sock, CMD_OK + "|Logged in as " + name);
+            logMessage(SERVER_LOG, "INFO", "User " + name + " connected");
+            std::cout << "[Server] User " << name << " connected" << std::endl;
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_MSG) {
+        std::string target, msg;
+        std::getline(iss, target, '|');
+        std::getline(iss, msg);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+
+        appendPMHistory(sender, target, sender, msg);
+        logMessage(SERVER_LOG, "MSG", "Private: " + sender + " -> " + target + ": " + msg);
+
+        int target_sock = -1;
+        for (auto& p : clients) {
+            if (p.second == target) {
+                target_sock = p.first;
+                break;
+            }
+        }
+        if (target_sock == -1) {
+            sendToClient(client_sock, CMD_OK + "|Message saved (User is offline)");
+        }
+        else {
+            sendToClient(target_sock, CMD_INMSG + "|" + sender + "|" + msg);
+            sendToClient(client_sock, CMD_OK + "|Message sent");
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_REQ_HISTORY) {
+        std::string type, target;
+        std::getline(iss, type, '|');
+        std::getline(iss, target);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        stateMtx.unlock();
+
+        if (type == "PM") {
+            sendPMHistoryToClient(client_sock, sender, target);
+        }
+    }
+    else if (cmd == CMD_GROUP_JOIN) {
+        std::string group_name;
+        std::getline(iss, group_name);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        if (groups.find(group_name) == groups.end()) {
+            Group g;
+            g.admin = sender;
+            g.members.insert(sender);
+            groups[group_name] = g;
+            saveGroupsConfig();
+
+            sendToClient(client_sock, CMD_OK + "|Group created. You are admin.");
+            logMessage(SERVER_LOG, "GROUP", sender + " created group " + group_name);
+            sendGroupHistoryToClient(client_sock, group_name);
+        }
+        else {
+            if (groups[group_name].members.count(sender)) {
+                sendToClient(client_sock, CMD_OK + "|Joined group.");
+                logMessage(SERVER_LOG, "GROUP", sender + " entered group " + group_name);
+                sendGroupHistoryToClient(client_sock, group_name);
+            }
+            else {
+                sendToClient(client_sock, CMD_ERROR + "|Access denied: You are not a member of this group. Admin must add you.");
+            }
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_GROUP_MSG) {
+        std::string group_name, msg;
+        std::getline(iss, group_name, '|');
+        std::getline(iss, msg);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        if (groups.find(group_name) != groups.end() && groups[group_name].members.count(sender)) {
+            appendGroupHistory(group_name, sender, msg);
+            logMessage(SERVER_LOG, "GMSG", "[" + group_name + "] " + sender + ": " + msg);
+
+            for (const auto& member : groups[group_name].members) {
+                for (auto& c : clients) {
+                    if (c.second == member && c.first != client_sock) {
+                        sendToClient(c.first, CMD_GROUP_MSG + "|" + group_name + "|" + sender + "|" + msg);
+                    }
+                }
+            }
+        }
+        else {
+            sendToClient(client_sock, CMD_ERROR + "|Access denied or group not found");
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_GROUP_ADD) {
+        std::string group_name, target;
+        std::getline(iss, group_name, '|');
+        std::getline(iss, target);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
+            groups[group_name].members.insert(target);
+            saveGroupsConfig();
+
+            sendToClient(client_sock, CMD_OK + "|User " + target + " added.");
+            logMessage(SERVER_LOG, "GROUP", sender + " added " + target + " to " + group_name);
+
+            for (auto& c : clients) {
+                if (c.second == target) {
+                    sendToClient(c.first, CMD_GROUP_NOTIFY + "|ADDED|" + group_name + "|" + sender);
+                    break;
+                }
+            }
+        }
+        else {
+            sendToClient(client_sock, CMD_ERROR + "|Only admin can add members");
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_GROUP_KICK) {
+        std::string group_name, target;
+        std::getline(iss, group_name, '|');
+        std::getline(iss, target);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
+            if (groups[group_name].members.erase(target)) {
+                saveGroupsConfig();
+
+                sendToClient(client_sock, CMD_OK + "|User " + target + " deleted.");
+                logMessage(SERVER_LOG, "GROUP", sender + " kicked " + target + " from " + group_name);
+
+                for (auto& c : clients) {
+                    if (c.second == target) {
+                        sendToClient(c.first, CMD_GROUP_NOTIFY + "|KICKED|" + group_name + "|" + sender);
+                        break;
+                    }
+                }
+            }
+            else {
+                sendToClient(client_sock, CMD_ERROR + "|User not in group");
+            }
+        }
+        else {
+            sendToClient(client_sock, CMD_ERROR + "|Only admin can delete members");
+        }
+        stateMtx.unlock();
+    }
+    else if (cmd == CMD_GROUP_DEL) {
+        std::string group_name;
+        std::getline(iss, group_name);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock];
+        if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
+            for (const auto& member : groups[group_name].members) {
+                for (auto& c : clients) {
+                    if (c.second == member) {
+                        sendToClient(c.first, CMD_GROUP_NOTIFY + "|DELETED|" + group_name);
+                    }
+                }
+            }
+            groups.erase(group_name);
+            saveGroupsConfig();
+            std::remove(getGroupFilename(group_name).c_str());
+
+            sendToClient(client_sock, CMD_OK + "|Group deleted.");
+            logMessage(SERVER_LOG, "GROUP", sender + " deleted group " + group_name);
+        }
+        else {
+            sendToClient(client_sock, CMD_ERROR + "|Only admin can delete the group");
+        }
+        stateMtx.unlock();
+    }
 }
 
 void* handleClient(void* arg) {
@@ -47,6 +337,8 @@ void* handleClient(void* arg) {
     delete (int*)arg;
 
     char buffer[BUFFER_SIZE];
+    std::string stream_buffer = ""; // Индивидуальный буфер накопления потока TCP
+
     while (server_running) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
@@ -63,199 +355,17 @@ void* handleClient(void* arg) {
             break;
         }
 
-        std::string data(buffer);
-        data.erase(std::remove(data.begin(), data.end(), '\n'), data.end());
-        data.erase(std::remove(data.begin(), data.end(), '\r'), data.end());
+        stream_buffer += std::string(buffer, bytes);
+        size_t pos;
+        // Извлекаем пакеты из потока строго по разделителю \n
+        while ((pos = stream_buffer.find('\n')) != std::string::npos) {
+            std::string command_line = stream_buffer.substr(0, pos);
+            stream_buffer.erase(0, pos + 1);
 
-        std::istringstream iss(data);
-        std::string cmd;
-        std::getline(iss, cmd, '|');
-
-        if (cmd == CMD_LOGIN) {
-            std::string name;
-            std::getline(iss, name);
-
-            stateMtx.lock();
-            bool nameExists = false;
-            for (auto& p : clients) {
-                if (p.second == name) {
-                    nameExists = true;
-                    break;
-                }
+            command_line.erase(std::remove(command_line.begin(), command_line.end(), '\r'), command_line.end());
+            if (!command_line.empty()) {
+                processClientCommand(client_sock, command_line);
             }
-            if (nameExists) {
-                sendToClient(client_sock, CMD_ERROR + "|Username already taken");
-                logMessage(SERVER_LOG, "WARNING", "Failed login attempt with name " + name);
-            }
-            else {
-                clients[client_sock] = name;
-                sendToClient(client_sock, CMD_OK + "|Logged in as " + name);
-                logMessage(SERVER_LOG, "INFO", "User " + name + " connected");
-                std::cout << "[Server] User " << name << " connected" << std::endl;
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_MSG) {
-            std::string target, msg;
-            std::getline(iss, target, '|');
-            std::getline(iss, msg);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            int target_sock = -1;
-            for (auto& p : clients) {
-                if (p.second == target) {
-                    target_sock = p.first;
-                    break;
-                }
-            }
-            if (target_sock == -1) {
-                sendToClient(client_sock, CMD_ERROR + "|User " + target + " not found");
-            }
-            else {
-                sendToClient(target_sock, CMD_INMSG + "|" + sender + "|" + msg);
-                logMessage(SERVER_LOG, "MSG", "Private: " + sender + " -> " + target + ": " + msg);
-                sendToClient(client_sock, CMD_OK + "|Message sent");
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_GROUP_JOIN) {
-            std::string group_name;
-            std::getline(iss, group_name);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            if (groups.find(group_name) == groups.end()) {
-                // Если группы нет — создаем её, автор автоматически становится админом
-                Group g;
-                g.admin = sender;
-                g.members.insert(sender);
-                groups[group_name] = g;
-                sendToClient(client_sock, CMD_OK + "|Group created. You are admin.");
-                logMessage(SERVER_LOG, "GROUP", sender + " created group " + group_name);
-            }
-            else {
-                // ИСПРАВЛЕНО: Если группа существует, войти можно ТОЛЬКО если тебя добавил админ
-                if (groups[group_name].members.count(sender)) {
-                    sendToClient(client_sock, CMD_OK + "|Joined group.");
-                    logMessage(SERVER_LOG, "GROUP", sender + " entered group " + group_name);
-                }
-                else {
-                    sendToClient(client_sock, CMD_ERROR + "|Access denied: You are not a member of this group. Admin must add you.");
-                    logMessage(SERVER_LOG, "GROUP", sender + " tried unauthorized join to " + group_name);
-                }
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_GROUP_MSG) {
-            std::string group_name, msg;
-            std::getline(iss, group_name, '|');
-            std::getline(iss, msg);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            if (groups.find(group_name) != groups.end() && groups[group_name].members.count(sender)) {
-                for (const auto& member : groups[group_name].members) {
-                    for (auto& c : clients) {
-                        if (c.second == member && c.first != client_sock) {
-                            sendToClient(c.first, CMD_GROUP_MSG + "|" + group_name + "|" + sender + "|" + msg);
-                        }
-                    }
-                }
-                logMessage(SERVER_LOG, "GMSG", "[" + group_name + "] " + sender + ": " + msg);
-            }
-            else {
-                sendToClient(client_sock, CMD_ERROR + "|Access denied or group not found");
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_GROUP_ADD) {
-            std::string group_name, target;
-            std::getline(iss, group_name, '|');
-            std::getline(iss, target);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
-                groups[group_name].members.insert(target);
-                sendToClient(client_sock, CMD_OK + "|User " + target + " added.");
-                logMessage(SERVER_LOG, "GROUP", sender + " added " + target + " to " + group_name);
-
-                for (auto& c : clients) {
-                    if (c.second == target) {
-                        sendToClient(c.first, CMD_GROUP_NOTIFY + "|ADDED|" + group_name + "|" + sender);
-                        break;
-                    }
-                }
-            }
-            else {
-                sendToClient(client_sock, CMD_ERROR + "|Only admin can add members");
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_GROUP_KICK) {
-            std::string group_name, target;
-            std::getline(iss, group_name, '|');
-            std::getline(iss, target);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
-                if (groups[group_name].members.erase(target)) {
-                    sendToClient(client_sock, CMD_OK + "|User " + target + " deleted.");
-                    logMessage(SERVER_LOG, "GROUP", sender + " kicked " + target + " from " + group_name);
-
-                    for (auto& c : clients) {
-                        if (c.second == target) {
-                            sendToClient(c.first, CMD_GROUP_NOTIFY + "|KICKED|" + group_name);
-                            break;
-                        }
-                    }
-                }
-                else {
-                    sendToClient(client_sock, CMD_ERROR + "|User not in group");
-                }
-            }
-            else {
-                sendToClient(client_sock, CMD_ERROR + "|Only admin can delete members");
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_GROUP_DEL) {
-            std::string group_name;
-            std::getline(iss, group_name);
-
-            stateMtx.lock();
-            std::string sender = clients[client_sock];
-            if (groups.find(group_name) != groups.end() && groups[group_name].admin == sender) {
-                for (const auto& member : groups[group_name].members) {
-                    for (auto& c : clients) {
-                        if (c.second == member) {
-                            sendToClient(c.first, CMD_GROUP_NOTIFY + "|DELETED|" + group_name);
-                        }
-                    }
-                }
-                groups.erase(group_name);
-                sendToClient(client_sock, CMD_OK + "|Group deleted.");
-                logMessage(SERVER_LOG, "GROUP", sender + " deleted group " + group_name);
-            }
-            else {
-                sendToClient(client_sock, CMD_ERROR + "|Only admin can delete the group");
-            }
-            stateMtx.unlock();
-        }
-        else if (cmd == CMD_QUIT) {
-            stateMtx.lock();
-            if (clients.find(client_sock) != clients.end()) {
-                std::string name = clients[client_sock];
-                logMessage(SERVER_LOG, "INFO", "User " + name + " quit");
-                std::cout << "[Server] User " << name << " quit" << std::endl;
-                sendToClient(client_sock, CMD_OK + "|Goodbye, " + name);
-                clients.erase(client_sock);
-            }
-            stateMtx.unlock();
-            close(client_sock);
-            break;
         }
     }
     return nullptr;
@@ -267,6 +377,8 @@ int main() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+
+    loadGroupsConfig();
 
     struct sockaddr_in address;
     int addrlen = sizeof(address);

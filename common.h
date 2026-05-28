@@ -13,12 +13,14 @@ const std::string CMD_OK = "OK";
 const std::string CMD_ERROR = "ERROR";
 const std::string CMD_INMSG = "INMSG";
 
-// Новые протоколы для работы с группами
 const std::string CMD_GROUP_JOIN = "GJOIN";
 const std::string CMD_GROUP_MSG = "GMSG";
 const std::string CMD_GROUP_ADD = "GADD";
 const std::string CMD_GROUP_KICK = "GKICK";
 const std::string CMD_GROUP_DEL = "GDEL";
 const std::string CMD_GROUP_NOTIFY = "GNOTIFY";
+
+const std::string CMD_REQ_HISTORY = "REQHIST";
+const std::string CMD_HIST_LINE = "HISTLINE";
 
 #endif
