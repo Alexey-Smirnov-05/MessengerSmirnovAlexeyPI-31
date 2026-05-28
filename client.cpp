@@ -13,19 +13,24 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+// Заголовочные файлы OpenSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include "common.h"
 #include "logger.h"
 
 std::string CLIENT_LOG;
 int sock = 0;
+SSL* ssl_conn = nullptr;
+SSL_CTX* client_ctx = nullptr;
 std::atomic<bool> running(true);
 
 std::string my_username;
 std::string active_chat_partner = "";
 std::string active_group = "";
-std::string pending_group = ""; // Tracks requested group until access permission is resolved
+std::string pending_group = "";
 
-// Variables to support message Reply and Forward actions
 std::string last_msg_sender = "";
 std::string last_msg_text = "";
 
@@ -36,14 +41,14 @@ std::mutex stateMutex;
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_RESET   "\033[0m"
 
-// Sends an outgoing data packet to the server with a trailing delimiter
+// Отправка зашифрованных команд через прослойку OpenSSL SSL_write
 bool sendCommand(const std::string& cmd) {
+    if (!ssl_conn) return false;
     std::string msg = cmd + "\n";
-    int sent = send(sock, msg.c_str(), msg.length(), 0);
+    int sent = SSL_write(ssl_conn, msg.c_str(), msg.length());
     return sent > 0;
 }
 
-// Parses and handles individual network packet incoming from the server
 void processIncomingPacket(const std::string& data) {
     std::istringstream iss(data);
     std::string cmd;
@@ -59,7 +64,6 @@ void processIncomingPacket(const std::string& data) {
 
         stateMutex.lock();
         std::string current_partner = active_chat_partner;
-        // Intercept metadata for real-time incoming messaging actions
         last_msg_sender = from;
         last_msg_text = msg;
         stateMutex.unlock();
@@ -81,7 +85,6 @@ void processIncomingPacket(const std::string& data) {
 
         stateMutex.lock();
         std::string current_group = active_group;
-        // Intercept metadata for real-time incoming messaging actions
         last_msg_sender = from;
         last_msg_text = msg;
         stateMutex.unlock();
@@ -125,7 +128,6 @@ void processIncomingPacket(const std::string& data) {
             std::getline(iss, admin);
             if (active_group == gname) {
                 active_group = "";
-                // Fixed divider color: COLOR_RESET placed directly after textual payload
                 output_to_print = std::string(COLOR_RED) + "\n[You were removed from group " + gname + " by admin " + admin + "]" + COLOR_RESET + "\n========================================";
             }
             else {
@@ -157,7 +159,6 @@ void processIncomingPacket(const std::string& data) {
         if (info.find("Goodbye") != std::string::npos) return;
 
         stateMutex.lock();
-        // Display group banner ONLY upon confirmed successful entry response
         if (!pending_group.empty() && (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
             active_group = pending_group;
             std::string gname = active_group;
@@ -183,7 +184,7 @@ void processIncomingPacket(const std::string& data) {
         need_display_update = true;
 
         stateMutex.lock();
-        pending_group = ""; // Clean attempt pointer upon receiving security error
+        pending_group = "";
         if (!active_group.empty()) {
             active_group = "";
         }
@@ -197,14 +198,14 @@ void processIncomingPacket(const std::string& data) {
     }
 }
 
-// Background listening thread pipeline
+// Поток чтения зашифрованных данных от сервера через OpenSSL SSL_read
 void* receiveThread(void*) {
     char buffer[BUFFER_SIZE];
     std::string stream_buffer = "";
 
     while (running) {
         memset(buffer, 0, BUFFER_SIZE);
-        int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+        int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
         if (bytes <= 0) {
             if (running) {
                 std::cout << "\r\033[K" << COLOR_RED << "\n[Disconnected from server]" << COLOR_RESET << std::endl;
@@ -256,6 +257,26 @@ int main() {
         return 1;
     }
 
+    // Инициализация клиентского окружения OpenSSL TLS
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    client_ctx = SSL_CTX_new(TLS_client_method());
+
+    // Разрешаем самоподписанные сертификаты без валидации цепочки доверия
+    SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
+
+    ssl_conn = SSL_new(client_ctx);
+    SSL_set_fd(ssl_conn, sock);
+
+    // Выполнение этапа TLS-Handshake (рукопожатия)
+    if (SSL_connect(ssl_conn) <= 0) {
+        std::cerr << "Secure TLS handshake failed." << std::endl;
+        SSL_free(ssl_conn);
+        close(sock);
+        SSL_CTX_free(client_ctx);
+        return 1;
+    }
+
     bool logged_in = false;
     while (!logged_in) {
         char* name_input = readline("Enter your username: ");
@@ -269,9 +290,11 @@ int main() {
 
         char buffer[BUFFER_SIZE];
         memset(buffer, 0, BUFFER_SIZE);
-        int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+        int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
         if (bytes <= 0) {
+            SSL_free(ssl_conn);
             close(sock);
+            SSL_CTX_free(client_ctx);
             return 1;
         }
 
@@ -303,7 +326,6 @@ int main() {
         if (input == "/quit") {
             running = false;
             sendCommand(CMD_QUIT);
-            // Crucial fix: unblock the blocking recv() call in background thread instantly
             shutdown(sock, SHUT_RDWR);
             break;
         }
@@ -325,7 +347,6 @@ int main() {
                 continue;
             }
 
-            // Handle active context REPLY operation
             if (input.rfind("/reply ", 0) == 0) {
                 std::string reply_payload = input.substr(7);
                 if (l_text.empty()) {
@@ -339,7 +360,6 @@ int main() {
                 continue;
             }
 
-            // Handle active context FORWARD operation
             if (input == "/forward") {
                 if (l_text.empty()) {
                     std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
@@ -380,7 +400,6 @@ int main() {
                 continue;
             }
 
-            // Handle active context Group REPLY operation
             if (input.rfind("/reply ", 0) == 0) {
                 std::string reply_payload = input.substr(7);
                 if (l_text.empty()) {
@@ -394,7 +413,6 @@ int main() {
                 continue;
             }
 
-            // Handle active context Group FORWARD operation
             if (input == "/forward") {
                 if (l_text.empty()) {
                     std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
@@ -444,7 +462,12 @@ int main() {
     }
 
     rl_cleanup_after_signal();
+    if (ssl_conn) {
+        SSL_shutdown(ssl_conn);
+        SSL_free(ssl_conn);
+    }
     close(sock);
+    if (client_ctx) SSL_CTX_free(client_ctx);
     pthread_join(recv_thread, NULL);
     std::cout << COLOR_YELLOW << "[Server]: Goodbye, " << my_username << COLOR_RESET << std::endl;
     return 0;

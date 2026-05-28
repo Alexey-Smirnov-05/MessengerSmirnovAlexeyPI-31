@@ -6,7 +6,7 @@
 const int DEFAULT_PORT = 8888;
 const int BUFFER_SIZE = 4096;
 
-// Network protocol command constants
+// Константы команд сетевого протокола
 const std::string CMD_LOGIN = "LOGIN";
 const std::string CMD_QUIT = "QUIT";
 const std::string CMD_MSG = "MSG";
