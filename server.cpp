@@ -15,7 +15,6 @@
 #include <mutex>
 #include <errno.h>
 
-// Заголовочные файлы OpenSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -30,7 +29,6 @@ struct ClientInfo {
     SSL* ssl;
 };
 
-// Хранилище подключенных клиентов: сокет -> структура ClientInfo
 std::map<int, ClientInfo> clients;
 
 struct Group {
@@ -45,7 +43,6 @@ volatile sig_atomic_t reload_config = 0;
 int server_fd = -1;
 SSL_CTX* server_ctx = nullptr;
 
-// Обработчик сигнала Ctrl+C (SIGINT) для корректного закрытия сервера
 void handle_sigint(int) {
     server_running = 0;
     if (server_fd != -1) {
@@ -53,7 +50,6 @@ void handle_sigint(int) {
     }
 }
 
-// Обработчик сигнала SIGHUP для перечитывания конфига на лету
 void handle_sighup(int) {
     reload_config = 1;
 }
@@ -123,7 +119,6 @@ void appendGroupHistory(const std::string& gname, const std::string& sender, con
     }
 }
 
-// Безопасная отправка данных через TLS-слой OpenSSL
 bool sendToClient(SSL* ssl, const std::string& message) {
     if (!ssl) return false;
     std::string msg = message + "\n";
@@ -176,6 +171,70 @@ void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
             std::cout << "[Server] User " << name << " connected securely" << std::endl;
         }
         stateMtx.unlock();
+    }
+    else if (cmd == CMD_QUIT) {
+        stateMtx.lock();
+        std::string name = clients[client_sock].username;
+        stateMtx.unlock();
+        sendToClient(ssl, CMD_OK + "|Goodbye!");
+        logMessage(SERVER_LOG, "INFO", "User " + name + " requested disconnect (QUIT)");
+    }
+    else if (cmd == CMD_REQ_ONLINE) {
+        stateMtx.lock();
+        std::string online_list = "";
+        bool first = true;
+        for (const auto& p : clients) {
+            if (!p.second.username.empty()) {
+                if (!first) online_list += ",";
+                online_list += p.second.username;
+                first = false;
+            }
+        }
+        stateMtx.unlock();
+        sendToClient(ssl, CMD_ONLINE_LIST + "|" + online_list);
+    }
+    else if (cmd == CMD_CLEAR) {
+        std::string type, target;
+        std::getline(iss, type, '|');
+        std::getline(iss, target);
+
+        stateMtx.lock();
+        std::string sender = clients[client_sock].username;
+        stateMtx.unlock();
+
+        if (type == "PM") {
+            std::string filename = getPMFilename(sender, target);
+            std::remove(filename.c_str()); // Физическое удаление истории ЛС
+            logMessage(SERVER_LOG, "INFO", "User " + sender + " cleared PM history with " + target);
+            sendToClient(ssl, CMD_OK + "|Private chat history cleared.");
+        }
+        else if (type == "GROUP") {
+            stateMtx.lock();
+            bool isAdmin = (groups.find(target) != groups.end() && groups[target].admin == sender);
+            stateMtx.unlock();
+
+            if (isAdmin) {
+                std::string filename = getGroupFilename(target);
+                std::remove(filename.c_str()); // Физическое удаление истории группы
+                logMessage(SERVER_LOG, "GROUP", "Admin " + sender + " cleared history for group " + target);
+
+                sendToClient(ssl, CMD_OK + "|Group chat history cleared.");
+
+                // Уведомляем участников группы в реальном времени, что история стёрта
+                stateMtx.lock();
+                for (const auto& member : groups[target].members) {
+                    for (auto& c : clients) {
+                        if (c.second.username == member) {
+                            sendToClient(c.second.ssl, CMD_GROUP_MSG + "|" + target + "|Server|Chat history was cleared by admin.");
+                        }
+                    }
+                }
+                stateMtx.unlock();
+            }
+            else {
+                sendToClient(ssl, CMD_ERROR + "|Access denied: Only group admin can clear group history.");
+            }
+        }
     }
     else if (cmd == CMD_MSG) {
         std::string target, msg;
@@ -358,7 +417,6 @@ void* handleClient(void* arg) {
     int client_sock = *(int*)arg;
     delete (int*)arg;
 
-    // Обертка системного сокета в защищенную TLS-сессию OpenSSL
     SSL* ssl = SSL_new(server_ctx);
     SSL_set_fd(ssl, client_sock);
     if (SSL_accept(ssl) <= 0) {
@@ -410,33 +468,29 @@ void* handleClient(void* arg) {
 }
 
 int main() {
-    // Регистрация обработчика SIGINT (Ctrl+C) для мягкой остановки
     struct sigaction sa_int;
     sa_int.sa_handler = handle_sigint;
     sigemptyset(&sa_int.sa_mask);
     sa_int.sa_flags = 0;
     sigaction(SIGINT, &sa_int, NULL);
 
-    // Регистрация обработчика SIGHUP для перезагрузки конфигурации
     struct sigaction sa_hup;
     sa_hup.sa_handler = handle_sighup;
     sigemptyset(&sa_hup.sa_mask);
     sa_hup.sa_flags = 0;
     sigaction(SIGHUP, &sa_hup, NULL);
 
-    // Инициализация криптографического движка OpenSSL
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
     server_ctx = SSL_CTX_new(TLS_server_method());
     if (!server_ctx) {
-        std::cerr << "Failed to allocate OpenSSL TLS memory engine context." << std::endl;
+        std::cerr << "Failed to allocate OpenSSL context." << std::endl;
         return 1;
     }
 
-    // Привязка SSL-сертификата и приватного ключа
     if (SSL_CTX_use_certificate_file(server_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(server_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
-        std::cerr << "SSL Certificates mismatch. Generate server.crt and server.key first!" << std::endl;
+        std::cerr << "SSL Certificates error." << std::endl;
         return 1;
     }
 
@@ -476,7 +530,7 @@ int main() {
         if (client_sock < 0) {
             if (reload_config) {
                 stateMtx.lock();
-                loadGroupsConfig(); // Перечитывание конфигурационных файлов «на лету»
+                loadGroupsConfig();
                 stateMtx.unlock();
                 reload_config = 0;
             }
@@ -505,11 +559,10 @@ int main() {
         }
     }
 
-    // Рассылка уведомлений клиентам при закрытии сервера: «Сервер пал, милорд»
     stateMtx.lock();
     logMessage(SERVER_LOG, "INFO", "Broadcasting termination notification sequence.");
     for (auto& p : clients) {
-        sendToClient(p.second.ssl, CMD_ERROR + "|Server is down, milord!");
+        sendToClient(p.second.ssl, CMD_ERROR + "|Server is down");
         SSL_shutdown(p.second.ssl);
         SSL_free(p.second.ssl);
         close(p.first);

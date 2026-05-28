@@ -24,4 +24,9 @@ const std::string CMD_GROUP_NOTIFY = "GNOTIFY";
 const std::string CMD_REQ_HISTORY = "REQHIST";
 const std::string CMD_HIST_LINE = "HISTLINE";
 
+const std::string CMD_REQ_ONLINE = "REQONLINE";
+const std::string CMD_ONLINE_LIST = "ONLINELIST";
+
+const std::string CMD_CLEAR = "CLEAR";
+
 #endif

@@ -13,7 +13,6 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
-// Заголовочные файлы OpenSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -41,7 +40,6 @@ std::mutex stateMutex;
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_RESET   "\033[0m"
 
-// Отправка зашифрованных команд через прослойку OpenSSL SSL_write
 bool sendCommand(const std::string& cmd) {
     if (!ssl_conn) return false;
     std::string msg = cmd + "\n";
@@ -75,6 +73,21 @@ void processIncomingPacket(const std::string& data) {
             output_to_print = std::string(COLOR_GREEN) + "[Notification]: PM from " + from + ": " + msg + COLOR_RESET;
         }
         logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
+        need_display_update = true;
+    }
+    else if (cmd == CMD_ONLINE_LIST) {
+        std::string list_str;
+        std::getline(iss, list_str);
+        std::istringstream oiss(list_str);
+        std::string uname;
+
+        output_to_print = std::string(COLOR_YELLOW) + "--- Users Online ---" + COLOR_RESET;
+        while (std::getline(oiss, uname, ',')) {
+            if (!uname.empty()) {
+                output_to_print += "\n" + uname;
+            }
+        }
+        output_to_print += std::string(COLOR_YELLOW) + "\n--------------------" + COLOR_RESET;
         need_display_update = true;
     }
     else if (cmd == CMD_GROUP_MSG) {
@@ -156,7 +169,6 @@ void processIncomingPacket(const std::string& data) {
     else if (cmd == CMD_OK) {
         std::string info;
         std::getline(iss, info);
-        if (info.find("Goodbye") != std::string::npos) return;
 
         stateMutex.lock();
         if (!pending_group.empty() && (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
@@ -198,7 +210,6 @@ void processIncomingPacket(const std::string& data) {
     }
 }
 
-// Поток чтения зашифрованных данных от сервера через OpenSSL SSL_read
 void* receiveThread(void*) {
     char buffer[BUFFER_SIZE];
     std::string stream_buffer = "";
@@ -257,18 +268,14 @@ int main() {
         return 1;
     }
 
-    // Инициализация клиентского окружения OpenSSL TLS
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
     client_ctx = SSL_CTX_new(TLS_client_method());
-
-    // Разрешаем самоподписанные сертификаты без валидации цепочки доверия
     SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
 
     ssl_conn = SSL_new(client_ctx);
     SSL_set_fd(ssl_conn, sock);
 
-    // Выполнение этапа TLS-Handshake (рукопожатия)
     if (SSL_connect(ssl_conn) <= 0) {
         std::cerr << "Secure TLS handshake failed." << std::endl;
         SSL_free(ssl_conn);
@@ -324,10 +331,37 @@ int main() {
         add_history(input.c_str());
 
         if (input == "/quit") {
-            running = false;
             sendCommand(CMD_QUIT);
+            usleep(200000); // 200мс задержка, чтобы поймать Goodbye от сервера до закрытия сокета
+            running = false;
             shutdown(sock, SHUT_RDWR);
             break;
+        }
+
+        // Обновленная команда /help в столбик на английском
+        if (input == "/help") {
+            std::cout << "\033[A\r\033[K" << COLOR_YELLOW
+                << "--- Available Commands Context Menu ---\n"
+                << "/chat [username]   - Open private message session with a user\n"
+                << "/group [#name]     - Create or enter a group channel (must start with #)\n"
+                << "/online            - Fetch list of all active users in a column\n"
+                << "/clear             - Delete entire chat history log files permanently\n"
+                << "/exit              - Close current active chat context menu safely\n"
+                << "/quit              - Shut down the client session and disconnect\n"
+                << "/reply [text]      - Fast quote reply to the last incoming message\n"
+                << "/forward           - Forward the last received text to this chat channel\n"
+                << "\n--- Special Group Admin Commands ---\n"
+                << "/add [username]    - Invite and bind user to this private group\n"
+                << "/delete [username] - Kick/remove member from group access list\n"
+                << "/delete_group      - Completely drop group stack and destroy its backup file\n"
+                << "----------------------------------------"
+                << COLOR_RESET << std::endl;
+            continue;
+        }
+
+        if (input == "/online") {
+            sendCommand(CMD_REQ_ONLINE);
+            continue;
         }
 
         stateMutex.lock();
@@ -336,6 +370,20 @@ int main() {
         std::string l_sender = last_msg_sender;
         std::string l_text = last_msg_text;
         stateMutex.unlock();
+
+        // Новая команда /clear
+        if (input == "/clear") {
+            if (!current_partner.empty()) {
+                sendCommand(CMD_CLEAR + "|PM|" + current_partner);
+            }
+            else if (!current_group.empty()) {
+                sendCommand(CMD_CLEAR + "|GROUP|" + current_group);
+            }
+            else {
+                std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: You must be inside a chat room or group to clear history." << COLOR_RESET << std::endl;
+            }
+            continue;
+        }
 
         if (!current_partner.empty()) {
             if (input == "/exit") {
@@ -456,7 +504,7 @@ int main() {
                 sendCommand(CMD_GROUP_JOIN + "|" + gname);
             }
             else {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Use: /chat <name> or /group <#name>" << COLOR_RESET << std::endl;
+                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Use: /chat <name>, /group <#name>, /online or /help" << COLOR_RESET << std::endl;
             }
         }
     }
@@ -469,6 +517,5 @@ int main() {
     close(sock);
     if (client_ctx) SSL_CTX_free(client_ctx);
     pthread_join(recv_thread, NULL);
-    std::cout << COLOR_YELLOW << "[Server]: Goodbye, " << my_username << COLOR_RESET << std::endl;
     return 0;
 }
