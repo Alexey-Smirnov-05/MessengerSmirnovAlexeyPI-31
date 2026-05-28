@@ -20,8 +20,10 @@
 const std::string SERVER_LOG = "server.log";
 const std::string GROUPS_CONFIG_FILE = "groups_config.txt";
 
+// Map to store connected clients: socket_fd -> username
 std::map<int, std::string> clients;
 
+// Struct to represent a group chat
 struct Group {
     std::string admin;
     std::set<std::string> members;
@@ -32,6 +34,7 @@ std::mutex stateMtx;
 volatile sig_atomic_t server_running = 1;
 int server_fd = -1;
 
+// Signal handler for clean server shutdown
 void handle_sigint(int) {
     server_running = 0;
     if (server_fd != -1) {
@@ -39,11 +42,13 @@ void handle_sigint(int) {
     }
 }
 
+// Generates filename for Private Message history file
 std::string getPMFilename(std::string u1, std::string u2) {
     if (u1 > u2) std::swap(u1, u2);
     return "history_pm_" + u1 + "_" + u2 + ".txt";
 }
 
+// Generates filename for Group history file
 std::string getGroupFilename(std::string gname) {
     if (!gname.empty() && gname[0] == '#') {
         return "history_group_" + gname.substr(1) + ".txt";
@@ -51,6 +56,7 @@ std::string getGroupFilename(std::string gname) {
     return "history_group_" + gname + ".txt";
 }
 
+// Saves existing groups into a configuration backup file
 void saveGroupsConfig() {
     std::ofstream f(GROUPS_CONFIG_FILE);
     if (!f.is_open()) return;
@@ -66,6 +72,7 @@ void saveGroupsConfig() {
     }
 }
 
+// Restores groups configuration from the backup file
 void loadGroupsConfig() {
     std::ifstream f(GROUPS_CONFIG_FILE);
     if (!f.is_open()) return;
@@ -89,6 +96,7 @@ void loadGroupsConfig() {
     std::cout << "[Server] Loaded " << groups.size() << " groups from backup file." << std::endl;
 }
 
+// Appends a private message to the file storage
 void appendPMHistory(const std::string& u1, const std::string& u2, const std::string& sender, const std::string& msg) {
     std::ofstream f(getPMFilename(u1, u2), std::ios::app);
     if (f.is_open()) {
@@ -96,6 +104,7 @@ void appendPMHistory(const std::string& u1, const std::string& u2, const std::st
     }
 }
 
+// Appends a group message to the file storage
 void appendGroupHistory(const std::string& gname, const std::string& sender, const std::string& msg) {
     std::ofstream f(getGroupFilename(gname), std::ios::app);
     if (f.is_open()) {
@@ -103,12 +112,14 @@ void appendGroupHistory(const std::string& gname, const std::string& sender, con
     }
 }
 
+// Sends raw data to a specific socket with a trailing delimiter
 bool sendToClient(int sock, const std::string& message) {
     std::string msg = message + "\n";
     int sent = send(sock, msg.c_str(), msg.length(), 0);
     return sent > 0;
 }
 
+// Streams file-based history lines of a PM chat to the client
 void sendPMHistoryToClient(int client_sock, const std::string& u1, const std::string& u2) {
     std::ifstream f(getPMFilename(u1, u2));
     if (!f.is_open()) return;
@@ -118,6 +129,7 @@ void sendPMHistoryToClient(int client_sock, const std::string& u1, const std::st
     }
 }
 
+// Streams file-based history lines of a group chat to the client
 void sendGroupHistoryToClient(int client_sock, const std::string& gname) {
     std::ifstream f(getGroupFilename(gname));
     if (!f.is_open()) return;
@@ -127,6 +139,7 @@ void sendGroupHistoryToClient(int client_sock, const std::string& gname) {
     }
 }
 
+// Parses and routes individual command lines received from clients
 void processClientCommand(int client_sock, const std::string& data) {
     std::istringstream iss(data);
     std::string cmd;
@@ -332,12 +345,13 @@ void processClientCommand(int client_sock, const std::string& data) {
     }
 }
 
+// Worker thread handling individual connected client sockets
 void* handleClient(void* arg) {
     int client_sock = *(int*)arg;
     delete (int*)arg;
 
     char buffer[BUFFER_SIZE];
-    std::string stream_buffer = ""; // Индивидуальный буфер накопления потока TCP
+    std::string stream_buffer = ""; // TCP data accumulator stream buffer
 
     while (server_running) {
         memset(buffer, 0, BUFFER_SIZE);
@@ -357,7 +371,7 @@ void* handleClient(void* arg) {
 
         stream_buffer += std::string(buffer, bytes);
         size_t pos;
-        // Извлекаем пакеты из потока строго по разделителю \n
+        // Extract packets based strictly on the newline delimiter
         while ((pos = stream_buffer.find('\n')) != std::string::npos) {
             std::string command_line = stream_buffer.substr(0, pos);
             stream_buffer.erase(0, pos + 1);

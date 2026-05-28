@@ -23,7 +23,12 @@ std::atomic<bool> running(true);
 std::string my_username;
 std::string active_chat_partner = "";
 std::string active_group = "";
-std::string pending_group = ""; // Для проверки прав доступа к группе перед отрисовкой UI
+std::string pending_group = ""; // Tracks requested group until access permission is resolved
+
+// Variables to support message Reply and Forward actions
+std::string last_msg_sender = "";
+std::string last_msg_text = "";
+
 std::mutex stateMutex;
 
 #define COLOR_YELLOW  "\033[33m"
@@ -31,12 +36,14 @@ std::mutex stateMutex;
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_RESET   "\033[0m"
 
+// Sends an outgoing data packet to the server with a trailing delimiter
 bool sendCommand(const std::string& cmd) {
     std::string msg = cmd + "\n";
     int sent = send(sock, msg.c_str(), msg.length(), 0);
     return sent > 0;
 }
 
+// Parses and handles individual network packet incoming from the server
 void processIncomingPacket(const std::string& data) {
     std::istringstream iss(data);
     std::string cmd;
@@ -52,13 +59,16 @@ void processIncomingPacket(const std::string& data) {
 
         stateMutex.lock();
         std::string current_partner = active_chat_partner;
+        // Intercept metadata for real-time incoming messaging actions
+        last_msg_sender = from;
+        last_msg_text = msg;
         stateMutex.unlock();
 
         if (from == current_partner) {
             output_to_print = "[" + from + "]: " + msg;
         }
         else {
-            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: ЛС от " + from + ": " + msg + COLOR_RESET;
+            output_to_print = std::string(COLOR_GREEN) + "[Notification]: PM from " + from + ": " + msg + COLOR_RESET;
         }
         logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
         need_display_update = true;
@@ -71,13 +81,16 @@ void processIncomingPacket(const std::string& data) {
 
         stateMutex.lock();
         std::string current_group = active_group;
+        // Intercept metadata for real-time incoming messaging actions
+        last_msg_sender = from;
+        last_msg_text = msg;
         stateMutex.unlock();
 
         if (gname == current_group) {
             output_to_print = "[" + from + "]: " + msg;
         }
         else {
-            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Новое в " + gname + " от " + from + ": " + msg + COLOR_RESET;
+            output_to_print = std::string(COLOR_GREEN) + "[Notification]: New in " + gname + " from " + from + ": " + msg + COLOR_RESET;
         }
         logMessage(CLIENT_LOG, "G_IN", "[" + gname + "] " + from + ": " + msg);
         need_display_update = true;
@@ -112,29 +125,28 @@ void processIncomingPacket(const std::string& data) {
             std::getline(iss, admin);
             if (active_group == gname) {
                 active_group = "";
-                // Фикс цвета: COLOR_RESET сдвинут до полосы разделителя
-                output_to_print = std::string(COLOR_RED) + "\n[Вы были удалены из группы " + gname + " администратором " + admin + "]" + COLOR_RESET + "\n========================================";
+                // Fixed divider color: COLOR_RESET placed directly after textual payload
+                output_to_print = std::string(COLOR_RED) + "\n[You were removed from group " + gname + " by admin " + admin + "]" + COLOR_RESET + "\n========================================";
             }
             else {
-                output_to_print = std::string(COLOR_RED) + "[Уведомление]: Администратор " + admin + " удалил вас из группы " + gname + COLOR_RESET;
+                output_to_print = std::string(COLOR_RED) + "[Notification]: Admin " + admin + " removed you from group " + gname + COLOR_RESET;
             }
             need_display_update = true;
         }
         else if (type == "DELETED") {
             if (active_group == gname) {
                 active_group = "";
-                // Фикс цвета полосы
-                output_to_print = std::string(COLOR_RED) + "\n[Группа " + gname + " была удалена администратором]" + COLOR_RESET + "\n========================================";
+                output_to_print = std::string(COLOR_RED) + "\n[Group " + gname + " was deleted by admin]" + COLOR_RESET + "\n========================================";
             }
             else {
-                output_to_print = std::string(COLOR_RED) + "[Уведомление]: Группа " + gname + " удалена администратором." + COLOR_RESET;
+                output_to_print = std::string(COLOR_RED) + "[Notification]: Group " + gname + " deleted by admin." + COLOR_RESET;
             }
             need_display_update = true;
         }
         else if (type == "ADDED") {
             std::string admin;
             std::getline(iss, admin);
-            output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Администратор " + admin + " добавил вас в группу " + gname + " (Теперь вы можете войти в неё)" + COLOR_RESET;
+            output_to_print = std::string(COLOR_GREEN) + "[Notification]: Admin " + admin + " added you to group " + gname + " (You can now join it)" + COLOR_RESET;
             need_display_update = true;
         }
         stateMutex.unlock();
@@ -145,14 +157,14 @@ void processIncomingPacket(const std::string& data) {
         if (info.find("Goodbye") != std::string::npos) return;
 
         stateMutex.lock();
-        // Отрисовка шапки только при реальном и успешном входе в группу
+        // Display group banner ONLY upon confirmed successful entry response
         if (!pending_group.empty() && (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
             active_group = pending_group;
             std::string gname = active_group;
             pending_group = "";
             stateMutex.unlock();
 
-            output_to_print = "\n========================================\n Групповой чат: " + gname + "\n========================================\nКоманды админа: /add <имя>, /delete <имя>, /delete_group\nДля выхода введите /exit\n";
+            output_to_print = "\n========================================\n Group Chat: " + gname + "\n========================================\nAdmin commands: /add <name>, /delete <name>, /delete_group\nType /exit to leave\n";
             need_display_update = true;
         }
         else {
@@ -171,7 +183,7 @@ void processIncomingPacket(const std::string& data) {
         need_display_update = true;
 
         stateMutex.lock();
-        pending_group = ""; // Сбрасываем попытку входа при ошибке
+        pending_group = ""; // Clean attempt pointer upon receiving security error
         if (!active_group.empty()) {
             active_group = "";
         }
@@ -185,6 +197,7 @@ void processIncomingPacket(const std::string& data) {
     }
 }
 
+// Background listening thread pipeline
 void* receiveThread(void*) {
     char buffer[BUFFER_SIZE];
     std::string stream_buffer = "";
@@ -290,30 +303,62 @@ int main() {
         if (input == "/quit") {
             running = false;
             sendCommand(CMD_QUIT);
+            // Crucial fix: unblock the blocking recv() call in background thread instantly
+            shutdown(sock, SHUT_RDWR);
             break;
         }
 
         stateMutex.lock();
         std::string current_partner = active_chat_partner;
         std::string current_group = active_group;
+        std::string l_sender = last_msg_sender;
+        std::string l_text = last_msg_text;
         stateMutex.unlock();
 
         if (!current_partner.empty()) {
             if (input == "/exit") {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[Вы вышли из чата с " << current_partner << "]" << COLOR_RESET << std::endl;
+                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[You left the chat with " << current_partner << "]" << COLOR_RESET << std::endl;
                 std::cout << "========================================" << std::endl;
                 stateMutex.lock();
                 active_chat_partner = "";
                 stateMutex.unlock();
                 continue;
             }
+
+            // Handle active context REPLY operation
+            if (input.rfind("/reply ", 0) == 0) {
+                std::string reply_payload = input.substr(7);
+                if (l_text.empty()) {
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to reply to." << COLOR_RESET << std::endl;
+                    continue;
+                }
+                std::string formatted = "(reply to " + l_sender + ": \"" + l_text + "\") " + reply_payload;
+                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
+                sendCommand(CMD_MSG + "|" + current_partner + "|" + formatted);
+                logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + formatted);
+                continue;
+            }
+
+            // Handle active context FORWARD operation
+            if (input == "/forward") {
+                if (l_text.empty()) {
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
+                    continue;
+                }
+                std::string formatted = "(fwd from " + l_sender + "): " + l_text;
+                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
+                sendCommand(CMD_MSG + "|" + current_partner + "|" + formatted);
+                logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + formatted);
+                continue;
+            }
+
             std::cout << "\033[A\r\033[K[" << my_username << "]: " << input << std::endl;
             sendCommand(CMD_MSG + "|" + current_partner + "|" + input);
             logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + input);
         }
         else if (!current_group.empty()) {
             if (input == "/exit") {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[Вы вышли из контекста группы " << current_group << "]" << COLOR_RESET << std::endl;
+                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[You left the group context " << current_group << "]" << COLOR_RESET << std::endl;
                 std::cout << "========================================" << std::endl;
                 stateMutex.lock();
                 active_group = "";
@@ -335,6 +380,33 @@ int main() {
                 continue;
             }
 
+            // Handle active context Group REPLY operation
+            if (input.rfind("/reply ", 0) == 0) {
+                std::string reply_payload = input.substr(7);
+                if (l_text.empty()) {
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to reply to." << COLOR_RESET << std::endl;
+                    continue;
+                }
+                std::string formatted = "(reply to " + l_sender + ": \"" + l_text + "\") " + reply_payload;
+                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
+                sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + formatted);
+                logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + formatted);
+                continue;
+            }
+
+            // Handle active context Group FORWARD operation
+            if (input == "/forward") {
+                if (l_text.empty()) {
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
+                    continue;
+                }
+                std::string formatted = "(fwd from " + l_sender + "): " + l_text;
+                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
+                sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + formatted);
+                logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + formatted);
+                continue;
+            }
+
             std::cout << "\033[A\r\033[K[" << my_username << "]: " << input << std::endl;
             sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + input);
             logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + input);
@@ -346,28 +418,27 @@ int main() {
                 stateMutex.lock();
                 active_chat_partner = target;
                 stateMutex.unlock();
-                std::cout << "\033[A\r\033[K\n========================================\n Чат с: " << target << "\n========================================\nДля выхода введите /exit\n" << std::endl;
+                std::cout << "\033[A\r\033[K\n========================================\n Chat with: " << target << "\n========================================\nType /exit to leave\n" << std::endl;
 
                 sendCommand(CMD_REQ_HISTORY + "|PM|" + target);
             }
             else if (input.rfind("/group ", 0) == 0) {
                 std::string gname = input.substr(7);
                 if (gname.empty() || gname[0] != '#') {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Ошибка]: Имя группы должно начинаться с '#'" << COLOR_RESET << std::endl;
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: Group name must start with '#'" << COLOR_RESET << std::endl;
                     continue;
                 }
 
-                // Стираем пользовательский ввод, но UI пока не рисуем
                 std::cout << "\033[A\r\033[K" << std::flush;
 
                 stateMutex.lock();
-                pending_group = gname; // Запоминаем, куда ломимся
+                pending_group = gname;
                 stateMutex.unlock();
 
                 sendCommand(CMD_GROUP_JOIN + "|" + gname);
             }
             else {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Используйте: /chat <имя> или /group <#название>" << COLOR_RESET << std::endl;
+                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Use: /chat <name> or /group <#name>" << COLOR_RESET << std::endl;
             }
         }
     }
