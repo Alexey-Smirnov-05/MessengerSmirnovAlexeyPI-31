@@ -12,5 +12,6 @@ const std::string CMD_QUIT = "QUIT";
 const std::string CMD_INMSG = "INMSG";
 const std::string CMD_ERROR = "ERROR";
 const std::string CMD_OK = "OK";
+const std::string CMD_STATUS = "STATUS";
 
 #endif

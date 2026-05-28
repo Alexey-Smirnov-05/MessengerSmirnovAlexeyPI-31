@@ -17,9 +17,14 @@
 const std::string SERVER_LOG = "server.log";
 std::map<int, std::string> clients;
 volatile sig_atomic_t server_running = 1;
+int server_fd = -1; // Вынесли в глобальную область, чтобы закрыть при Ctrl+C
 
 void handle_sigint(int) {
     server_running = 0;
+    if (server_fd != -1) {
+        // Насильно закрываем слушающий сокет, чтобы прервать блокирующий accept()
+        close(server_fd);
+    }
 }
 
 bool sendToClient(int sock, const std::string& message) {
@@ -95,12 +100,10 @@ void* handleClient(void* arg) {
             if (target_sock == -1) {
                 sendToClient(client_sock, CMD_ERROR + "|User " + target + " not found");
                 logMessage(SERVER_LOG, "WARNING", "Message from " + sender + " to " + target + " failed: user not found");
-                std::cout << "[Server] Message from " << sender << " to " << target << " FAILED (user not found)" << std::endl;
             }
             else {
                 sendToClient(target_sock, CMD_INMSG + "|" + sender + "|" + msg);
                 logMessage(SERVER_LOG, "INFO", "Message from " + sender + " to " + target + ": " + msg);
-                std::cout << "[Server] Message from " << sender << " to " << target << ": " << msg << std::endl;
                 sendToClient(client_sock, CMD_OK + "|Message sent");
             }
         }
@@ -118,17 +121,18 @@ void* handleClient(void* arg) {
             close(client_sock);
             break;
         }
-        else {
-            sendToClient(client_sock, CMD_ERROR + "|Unknown command");
-        }
     }
     return nullptr;
 }
 
 int main() {
-    signal(SIGINT, handle_sigint);
+    // Настраиваем обработку Ctrl+C
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
-    int server_fd, client_sock;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
 
@@ -136,6 +140,9 @@ int main() {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -146,7 +153,6 @@ int main() {
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-
     if (listen(server_fd, 10) < 0) {
         perror("listen");
         close(server_fd);
@@ -154,10 +160,13 @@ int main() {
     }
 
     logMessage(SERVER_LOG, "INFO", "Server started on port " + std::to_string(DEFAULT_PORT));
-    std::cout << "[Server] Listening on port " << DEFAULT_PORT << std::endl;
+    std::cout << "[Server] Listening on port " << DEFAULT_PORT << " (Press Ctrl+C to shutdown)" << std::endl;
 
     while (server_running) {
-        if ((client_sock = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0) {
+        // Добавляем int перед client_sock
+        int client_sock = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        if (client_sock < 0) {
+            // Если accept завершился ошибкой из-за закрытия сокета по Ctrl+C
             if (!server_running) break;
             perror("accept");
             continue;
@@ -166,7 +175,6 @@ int main() {
         *new_sock = client_sock;
         pthread_t thread_id;
         if (pthread_create(&thread_id, NULL, handleClient, new_sock) != 0) {
-            perror("pthread_create");
             delete new_sock;
             close(client_sock);
         }
@@ -175,8 +183,7 @@ int main() {
         }
     }
 
-    close(server_fd);
-    logMessage(SERVER_LOG, "INFO", "Server stopped");
-    std::cout << "[Server] Stopped." << std::endl;
+    logMessage(SERVER_LOG, "INFO", "Server stopped gracefully");
+    std::cout << "\n[Server] Stopped gracefully." << std::endl;
     return 0;
 }

@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sstream>
 #include <atomic>
+#include <mutex>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -18,8 +19,12 @@ std::string CLIENT_LOG;
 int sock = 0;
 std::atomic<bool> running(true);
 
+std::string active_chat_partner = "";
+std::mutex stateMutex;
+
 #define COLOR_YELLOW  "\033[33m"
 #define COLOR_RED     "\033[31m"
+#define COLOR_GREEN   "\033[32m"
 #define COLOR_RESET   "\033[0m"
 
 bool sendCommand(const std::string& cmd) {
@@ -34,9 +39,10 @@ void* receiveThread(void*) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
         if (bytes <= 0) {
-            // Очищаем текущую строку ввода перед выводом системного сообщения
-            std::cout << "\r\033[K" << COLOR_RED << "\n[Disconnected from server]" << COLOR_RESET << std::endl;
-            running = false;
+            if (running) { // Выводим ошибку только если мы не сами выходим
+                std::cout << "\r\033[K" << COLOR_RED << "\n[Disconnected from server]" << COLOR_RESET << std::endl;
+                running = false;
+            }
             break;
         }
 
@@ -52,14 +58,27 @@ void* receiveThread(void*) {
             std::string from, msg;
             std::getline(iss, from, '|');
             std::getline(iss, msg);
-            output_to_print = "[" + from + "]: " + msg;
+
+            stateMutex.lock();
+            std::string current_partner = active_chat_partner;
+            stateMutex.unlock();
+
+            if (from == current_partner) {
+                output_to_print = "[" + from + "]: " + msg;
+            }
+            else {
+                output_to_print = std::string(COLOR_GREEN) + "[Уведомление]: Новое сообщение от " + from + ": " + msg + COLOR_RESET;
+            }
             logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
             need_display_update = true;
         }
         else if (cmd == CMD_OK) {
             std::string info;
             std::getline(iss, info);
-            // Если это просто подтверждение отправки, на экран его не выводим, чтобы не спамить
+            // Если это ответ на логаут, глушим вывод, чтобы не дублировать на выходе
+            if (info.find("Goodbye") != std::string::npos) {
+                continue;
+            }
             if (info != "Message sent") {
                 output_to_print = COLOR_YELLOW + std::string("[Server]: ") + info + COLOR_RESET;
                 need_display_update = true;
@@ -73,13 +92,8 @@ void* receiveThread(void*) {
             need_display_update = true;
         }
 
-        // Если нужно вывести текст на экран, делаем это атомарно для Readline
-        if (need_display_update) {
-            // \r - возвращает курсор в начало строки, \033[K - очищает строку до конца
+        if (need_display_update && running) {
             std::cout << "\r\033[K" << output_to_print << std::endl;
-
-            // Магия Readline: уведомляем, что мы перешли на новую строку, 
-            // и принудительно перерисовываем prompt вместе с тем, что пользователь успел набрать
             rl_on_new_line();
             rl_redisplay();
         }
@@ -92,12 +106,11 @@ int main() {
     int port = DEFAULT_PORT;
     std::string username;
 
-    // Цикл ввода IP
     while (true) {
-        char* input = readline("Enter server IP (or 'localhost'): ");
-        if (!input) return 0;
-        server_ip = input;
-        free(input);
+        char* input_ip = readline("Enter server IP (or 'localhost'): ");
+        if (!input_ip) return 0;
+        server_ip = input_ip;
+        free(input_ip);
         if (server_ip == "localhost" || server_ip == "127.0.0.1") {
             server_ip = "127.0.0.1";
             break;
@@ -109,7 +122,6 @@ int main() {
         std::cout << COLOR_RED << "[Error]: Invalid IP address, please try again." << COLOR_RESET << std::endl;
     }
 
-    // Создание сокета
     struct sockaddr_in serv_addr;
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         std::cerr << "Socket creation error" << std::endl;
@@ -126,7 +138,6 @@ int main() {
         return 1;
     }
 
-    // Цикл логина
     bool logged_in = false;
     while (!logged_in) {
         char* name_input = readline("Enter your username: ");
@@ -169,63 +180,96 @@ int main() {
         }
     }
 
-    // Запускаем поток приёма
     pthread_t recv_thread;
     pthread_create(&recv_thread, NULL, receiveThread, NULL);
 
-    // Инициализация истории стрелочек (вверх/вниз)
     using_history();
-
-    // Формируем постоянный prompt для текущего пользователя
     std::string prompt = "[" + username + "]: ";
     char* line;
 
     while (running) {
-        line = readline(prompt.c_str()); // Передаем промпт прямо сюда!
+        line = readline(prompt.c_str());
         if (!line) break;
         std::string input(line);
         free(line);
         if (input.empty()) continue;
 
-        // Добавляем команду в историю стрелочек вверх/вниз
         add_history(input.c_str());
 
         if (input == "/quit") {
+            running = false; // Отключаем флаг отрисовщика немедленно
             sendCommand(CMD_QUIT);
-            running = false;
             break;
         }
 
-        size_t space = input.find(' ');
-        if (space == std::string::npos) {
-            // \033[A - поднимает курсор вверх на одну строку (туда, где остался сырой неверный ввод)
-            // \r\033[K - затирает её и выводит предупреждение
-            std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Usage: <recipient> <message>" << COLOR_RESET << std::endl;
-            continue;
-        }
+        stateMutex.lock();
+        std::string current_partner = active_chat_partner;
+        stateMutex.unlock();
 
-        std::string recipient = input.substr(0, space);
-        std::string message = input.substr(space + 1);
-        if (recipient.empty() || message.empty()) {
-            std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Invalid format. Use: recipient message" << COLOR_RESET << std::endl;
-            continue;
-        }
+        if (!current_partner.empty()) {
+            if (input == "/exit") {
+                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[Вы вышли из чата с " << current_partner << "]" << COLOR_RESET << std::endl;
+                // Твоя разделительная черта завершения чата
+                std::cout << "========================================" << std::endl;
 
-        // Элегантный трюк: стираем сырую строчку readline (например, "Alexey привет")
-        // и на ее месте пишем красивое "[Sveta]: привет"
-        std::cout << "\033[A\r\033[K[" << username << "]: " << message << std::endl;
+                stateMutex.lock();
+                active_chat_partner = "";
+                stateMutex.unlock();
+                continue;
+            }
+            if (input.rfind("/chat ", 0) == 0) {
+                std::cout << "\033[A\r\033[K" << COLOR_RED << "[Ошибка]: Вы уже в чате с " << current_partner << ". Сначала введите /exit" << COLOR_RESET << std::endl;
+                continue;
+            }
 
-        std::string cmd = CMD_MSG + "|" + recipient + "|" + message;
-        if (!sendCommand(cmd)) {
-            std::cout << COLOR_RED << "Failed to send message. Connection lost?" << COLOR_RESET << std::endl;
-            running = false;
-            break;
+            std::cout << "\033[A\r\033[K[" << username << "]: " << input << std::endl;
+
+            std::string cmd = CMD_MSG + "|" + current_partner + "|" + input;
+            if (!sendCommand(cmd)) {
+                std::cout << COLOR_RED << "Failed to send message." << COLOR_RESET << std::endl;
+                running = false;
+                break;
+            }
+            logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + input);
         }
-        logMessage(CLIENT_LOG, "OUT", "To " + recipient + ": " + message);
+        else {
+            if (input == "/exit") {
+                std::cout << "\033[A\r\033[K" << COLOR_RED << "[Ошибка]: Вы не находитесь в чате." << COLOR_RESET << std::endl;
+                continue;
+            }
+            if (input.rfind("/chat ", 0) == 0) {
+                std::string target = input.substr(6);
+                target.erase(target.find_last_not_of(" \t\n\r\f\v") + 1);
+                target.erase(0, target.find_first_not_of(" \t\n\r\f\v"));
+
+                if (target.empty() || target == username) {
+                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Ошибка]: Некорректное имя пользователя." << COLOR_RESET << std::endl;
+                    continue;
+                }
+
+                stateMutex.lock();
+                active_chat_partner = target;
+                stateMutex.unlock();
+
+                // Отрисовка чистой статической рамки без динамического статуса
+                std::cout << "\033[A\r\033[K"
+                    << "\n========================================\n"
+                    << " Чат с: " << target << "\n"
+                    << "========================================\n"
+                    << "Для выхода введите /exit\n" << std::endl;
+                continue;
+            }
+
+            std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Вы не в чате. Используйте: /chat <имя_пользователя>" << COLOR_RESET << std::endl;
+        }
     }
 
+    // Чистим за собой состояние терминала readline, чтобы убрать дублирование /quit
+    rl_cleanup_after_signal();
     close(sock);
     pthread_join(recv_thread, NULL);
     logMessage(CLIENT_LOG, "INFO", "Client terminated");
+
+    std::cout << COLOR_YELLOW << "[Server]: Goodbye, " << username << COLOR_RESET << std::endl;
     return 0;
 }
