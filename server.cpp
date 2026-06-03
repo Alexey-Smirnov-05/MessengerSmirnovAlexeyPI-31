@@ -1,58 +1,62 @@
-#include <iostream>
-#include <string>
-#include <cstring>
-#include <fstream>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <map>
-#include <set>
-#include <sstream>
-#include <algorithm>
-#include <pthread.h>
-#include <signal.h>
-#include <mutex>
-#include <errno.h>
+#include <iostream>      // Для вывода в консоль (std::cout, std::cerr, std::endl)
+#include <string>        // Для работы со строками типа std::string
+#include <cstring>       // Для работы с C-строками и функциями memset, strcpy
+#include <fstream>       // Для работы с файлами (чтение историй сообщений и конфигов)
+#include <map>           // Для хранения данных в виде пар "ключ-значение" (словари)
+#include <set>           // Для хранения уникальных элементов (списки участников групп)
+#include <sstream>       // Для парсинга строк через строковые потоки (std::istringstream)
+#include <algorithm>     // Для алгоритмов вроде std::swap и std::remove
+#include <thread>        // Для создания и управления параллельными потоками
+#include <mutex>         // Для синхронизации потоков (взаимное исключение — мьютекс)
+#include <signal.h>      // Для обработки системных сигналов (SIGINT, SIGHUP)
+#include <csignal>       // Стандартный C++ аналог signal.h
+#include <errno.h>       // Для работы с кодами системных ошибок
+#include <filesystem>    // Для работы с файловой системой (удаление файлов)
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <openssl/ssl.h> // Главная библиотека OpenSSL для безопасного соединения
+#include <openssl/err.h> // Для получения расшифровки ошибок OpenSSL
 
-#include "common.h"
-#include "logger.h"
+#include "common.h"      // Твой кастомный файл с общими макросами (CMD_LOGIN, DEFAULT_PORT, SOCKET и т.д.)
+#include "logger.h"      // Твой кастомный файл с функцией логирования logMessage
+
+namespace fs = std::filesystem; // Глобальные пространства имен и константы
 
 const std::string SERVER_LOG = "server.log";
 const std::string GROUPS_CONFIG_FILE = "groups_config.txt";
 
+// Структуры данных и глобальное состояние сервера
 struct ClientInfo {
-    std::string username;
-    SSL* ssl;
+    std::string username; // имя пользователя (сначала пустое, заполняется после авторизации)
+    SSL* ssl; // указатель на SSL-структуру OpenSSL, через которую идет шифрованный обмен данными с этим клиентом.
 };
 
-std::map<int, ClientInfo> clients;
+std::map<SOCKET, ClientInfo> clients; // clients — глобальный ассоциативный массив (карта). Ключом является дескриптор сокета (SOCKET), а значением — структура ClientInfo.
 
+// Group — структура для описания чат - группы.
 struct Group {
     std::string admin;
     std::set<std::string> members;
 };
-std::map<std::string, Group> groups;
+std::map<std::string, Group> groups; // stateMtx — объект мьютекса.
 
 std::mutex stateMtx;
-volatile sig_atomic_t server_running = 1;
-volatile sig_atomic_t reload_config = 0;
-int server_fd = -1;
-SSL_CTX* server_ctx = nullptr;
+volatile sig_atomic_t server_running = 1; // флаг работы сервера. Если 1 — сервер работает.
+volatile sig_atomic_t reload_config = 0; // гарантирует, что переменная будет безопасно изменена внутри обработчиков системных сигналов.
+SOCKET server_fd = INVALID_SOCKET; // server_fd — главный слушающий сокет сервера. Через него сервер принимает новые входящие подключения.
+SSL_CTX* server_ctx = nullptr; // server_ctx — указатель на контекст OpenSSL. В нем хранятся настройки шифрования, сертификаты и приватный ключ сервера.
 
 void handle_sigint(int) {
     server_running = 0;
-    if (server_fd != -1) {
-        close(server_fd);
+    if (server_fd != INVALID_SOCKET) {
+        closesocket(server_fd);
     }
 }
 
+#ifndef _WIN32
 void handle_sighup(int) {
     reload_config = 1;
 }
+#endif
 
 std::string getPMFilename(std::string u1, std::string u2) {
     if (u1 > u2) std::swap(u1, u2);
@@ -122,7 +126,7 @@ void appendGroupHistory(const std::string& gname, const std::string& sender, con
 bool sendToClient(SSL* ssl, const std::string& message) {
     if (!ssl) return false;
     std::string msg = message + "\n";
-    int sent = SSL_write(ssl, msg.c_str(), msg.length());
+    int sent = SSL_write(ssl, msg.c_str(), static_cast<int>(msg.length()));
     return sent > 0;
 }
 
@@ -144,7 +148,7 @@ void sendGroupHistoryToClient(SSL* ssl, const std::string& gname) {
     }
 }
 
-void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
+void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data) {
     std::istringstream iss(data);
     std::string cmd;
     std::getline(iss, cmd, '|');
@@ -204,7 +208,7 @@ void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
 
         if (type == "PM") {
             std::string filename = getPMFilename(sender, target);
-            std::remove(filename.c_str()); // Физическое удаление истории ЛС
+            fs::remove(filename); // Кроссплатформенное удаление файла истории
             logMessage(SERVER_LOG, "INFO", "User " + sender + " cleared PM history with " + target);
             sendToClient(ssl, CMD_OK + "|Private chat history cleared.");
         }
@@ -215,12 +219,11 @@ void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
 
             if (isAdmin) {
                 std::string filename = getGroupFilename(target);
-                std::remove(filename.c_str()); // Физическое удаление истории группы
+                fs::remove(filename); // Кроссплатформенное удаление файла истории
                 logMessage(SERVER_LOG, "GROUP", "Admin " + sender + " cleared history for group " + target);
 
                 sendToClient(ssl, CMD_OK + "|Group chat history cleared.");
 
-                // Уведомляем участников группы в реальном времени, что история стёрта
                 stateMtx.lock();
                 for (const auto& member : groups[target].members) {
                     for (auto& c : clients) {
@@ -401,7 +404,7 @@ void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
             }
             groups.erase(group_name);
             saveGroupsConfig();
-            std::remove(getGroupFilename(group_name).c_str());
+            fs::remove(getGroupFilename(group_name));
 
             sendToClient(ssl, CMD_OK + "|Group deleted.");
             logMessage(SERVER_LOG, "GROUP", sender + " deleted group " + group_name);
@@ -413,16 +416,13 @@ void processClientCommand(int client_sock, SSL* ssl, const std::string& data) {
     }
 }
 
-void* handleClient(void* arg) {
-    int client_sock = *(int*)arg;
-    delete (int*)arg;
-
+void handleClient(SOCKET client_sock) {
     SSL* ssl = SSL_new(server_ctx);
-    SSL_set_fd(ssl, client_sock);
+    SSL_set_fd(ssl, static_cast<int>(client_sock));
     if (SSL_accept(ssl) <= 0) {
         SSL_free(ssl);
-        close(client_sock);
-        return nullptr;
+        closesocket(client_sock);
+        return;
     }
 
     stateMtx.lock();
@@ -448,7 +448,7 @@ void* handleClient(void* arg) {
             stateMtx.unlock();
             SSL_shutdown(ssl);
             SSL_free(ssl);
-            close(client_sock);
+            closesocket(client_sock);
             break;
         }
 
@@ -464,33 +464,33 @@ void* handleClient(void* arg) {
             }
         }
     }
-    return nullptr;
 }
 
 int main() {
-    struct sigaction sa_int;
-    sa_int.sa_handler = handle_sigint;
-    sigemptyset(&sa_int.sa_mask);
-    sa_int.sa_flags = 0;
-    sigaction(SIGINT, &sa_int, NULL);
+    if (!initNetwork()) {
+        std::cerr << "Failed to init network architecture." << std::endl;
+        return 1;
+    }
 
-    struct sigaction sa_hup;
-    sa_hup.sa_handler = handle_sighup;
-    sigemptyset(&sa_hup.sa_mask);
-    sa_hup.sa_flags = 0;
-    sigaction(SIGHUP, &sa_hup, NULL);
+    signal(SIGINT, handle_sigint);
+#ifndef _WIN32
+    signal(SIGHUP, handle_sighup);
+#endif
 
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
     server_ctx = SSL_CTX_new(TLS_server_method());
     if (!server_ctx) {
         std::cerr << "Failed to allocate OpenSSL context." << std::endl;
+        cleanupNetwork();
         return 1;
     }
 
     if (SSL_CTX_use_certificate_file(server_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(server_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
         std::cerr << "SSL Certificates error." << std::endl;
+        SSL_CTX_free(server_ctx);
+        cleanupNetwork();
         return 1;
     }
 
@@ -499,35 +499,41 @@ int main() {
     struct sockaddr_in address;
     int addrlen = sizeof(address);
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+        std::cerr << "Socket allocation failed" << std::endl;
+        SSL_CTX_free(server_ctx);
+        cleanupNetwork();
+        return 1;
     }
 
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(DEFAULT_PORT);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+        std::cerr << "Bind failed" << std::endl;
+        closesocket(server_fd);
+        SSL_CTX_free(server_ctx);
+        cleanupNetwork();
+        return 1;
     }
     if (listen(server_fd, 10) < 0) {
-        perror("listen");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+        std::cerr << "Listen failed" << std::endl;
+        closesocket(server_fd);
+        SSL_CTX_free(server_ctx);
+        cleanupNetwork();
+        return 1;
     }
 
     logMessage(SERVER_LOG, "INFO", "Secure Server started on port " + std::to_string(DEFAULT_PORT));
-    std::cout << "[Server] Secure TLS Listening on port " << DEFAULT_PORT << " (PID: " << getpid() << ")" << std::endl;
+    std::cout << "[Server] Secure TLS Listening on port " << DEFAULT_PORT << std::endl;
 
     while (server_running) {
-        int client_sock = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
-        if (client_sock < 0) {
+        SOCKET client_sock = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        if (client_sock == INVALID_SOCKET) {
             if (reload_config) {
                 stateMtx.lock();
                 loadGroupsConfig();
@@ -535,8 +541,6 @@ int main() {
                 reload_config = 0;
             }
             if (!server_running) break;
-            if (errno == EINTR) continue;
-            perror("accept");
             continue;
         }
 
@@ -547,16 +551,8 @@ int main() {
             reload_config = 0;
         }
 
-        int* new_sock = new int;
-        *new_sock = client_sock;
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, handleClient, new_sock) != 0) {
-            delete new_sock;
-            close(client_sock);
-        }
-        else {
-            pthread_detach(thread_id);
-        }
+        // Запускаем стандартный кроссплатформенный std::thread вместо pthread
+        std::thread(handleClient, client_sock).detach();
     }
 
     stateMtx.lock();
@@ -565,12 +561,13 @@ int main() {
         sendToClient(p.second.ssl, CMD_ERROR + "|Server is down");
         SSL_shutdown(p.second.ssl);
         SSL_free(p.second.ssl);
-        close(p.first);
+        closesocket(p.first);
     }
     clients.clear();
     stateMtx.unlock();
 
     SSL_CTX_free(server_ctx);
+    cleanupNetwork();
     logMessage(SERVER_LOG, "INFO", "Server stopped gracefully");
     std::cout << "\n[Server] Stopped gracefully." << std::endl;
     return 0;

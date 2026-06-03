@@ -1,17 +1,37 @@
 #include <iostream>
 #include <string>
 #include <cstring>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
 #include <sstream>
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <thread>
+#include <chrono>
+
+// --- НАСТРОЙКА READLINE ДЛЯ WINDOWS И LINUX ---
+#ifndef _WIN32
 #include <readline/readline.h>
 #include <readline/history.h>
+#else
+    // Заглушки функций readline для Windows, чтобы код компилировался без внешних зависимостей
+inline char* readline(const char* prompt) {
+    std::cout << prompt;
+    std::string s;
+    if (!std::getline(std::cin, s)) return nullptr;
+    char* res = (char*)malloc(s.size() + 1);
+#ifdef _MSC_VER
+    strcpy_s(res, s.size() + 1, s.c_str());
+#else
+    strcpy(res, s.c_str());
+#endif
+    return res;
+}
+inline void add_history(const char*) {}
+inline void using_history() {}
+inline void rl_on_new_line() {}
+inline void rl_redisplay() {}
+inline void rl_cleanup_after_signal() {}
+#endif
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -20,7 +40,7 @@
 #include "logger.h"
 
 std::string CLIENT_LOG;
-int sock = 0;
+SOCKET sock = INVALID_SOCKET;
 SSL* ssl_conn = nullptr;
 SSL_CTX* client_ctx = nullptr;
 std::atomic<bool> running(true);
@@ -34,7 +54,6 @@ std::string last_msg_sender = "";
 std::string last_msg_text = "";
 
 std::mutex stateMutex;
-
 #define COLOR_YELLOW  "\033[33m"
 #define COLOR_RED     "\033[31m"
 #define COLOR_GREEN   "\033[32m"
@@ -43,7 +62,7 @@ std::mutex stateMutex;
 bool sendCommand(const std::string& cmd) {
     if (!ssl_conn) return false;
     std::string msg = cmd + "\n";
-    int sent = SSL_write(ssl_conn, msg.c_str(), msg.length());
+    int sent = SSL_write(ssl_conn, msg.c_str(), static_cast<int>(msg.length()));
     return sent > 0;
 }
 
@@ -65,7 +84,6 @@ void processIncomingPacket(const std::string& data) {
         last_msg_sender = from;
         last_msg_text = msg;
         stateMutex.unlock();
-
         if (from == current_partner) {
             output_to_print = "[" + from + "]: " + msg;
         }
@@ -101,7 +119,6 @@ void processIncomingPacket(const std::string& data) {
         last_msg_sender = from;
         last_msg_text = msg;
         stateMutex.unlock();
-
         if (gname == current_group) {
             output_to_print = "[" + from + "]: " + msg;
         }
@@ -197,23 +214,23 @@ void processIncomingPacket(const std::string& data) {
 
         stateMutex.lock();
         pending_group = "";
-        if (!active_group.empty()) {
-            active_group = "";
-        }
+        // ИСПРАВЛЕНО: Больше не сбрасываем active_group = "", чтобы пользователя не выкидывало из чата при ошибках!
         stateMutex.unlock();
     }
 
-    if (need_display_update && running) {
+    // ИСПРАВЛЕНО: Печатаем ответ сервера всегда, но обновляем readline-промпт только если работа продолжается
+    if (need_display_update) {
         std::cout << "\r\033[K" << output_to_print << std::endl;
-        rl_on_new_line();
-        rl_redisplay();
+        if (running) {
+            rl_on_new_line();
+            rl_redisplay();
+        }
     }
 }
 
-void* receiveThread(void*) {
+void receiveThread() {
     char buffer[BUFFER_SIZE];
     std::string stream_buffer = "";
-
     while (running) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
@@ -237,15 +254,18 @@ void* receiveThread(void*) {
             }
         }
     }
-    return nullptr;
 }
 
 int main() {
-    std::string server_ip;
+    if (!initNetwork()) {
+        std::cerr << "Failed to init network architecture." << std::endl;
+        return 1;
+    }
 
+    std::string server_ip;
     while (true) {
         char* input_ip = readline("Enter server IP (or 'localhost'): ");
-        if (!input_ip) return 0;
+        if (!input_ip) { cleanupNetwork(); return 0; }
         server_ip = input_ip;
         free(input_ip);
         if (server_ip == "localhost" || server_ip == "127.0.0.1") {
@@ -258,13 +278,15 @@ int main() {
     }
 
     struct sockaddr_in serv_addr;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) return 1;
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) { cleanupNetwork(); return 1; }
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(DEFAULT_PORT);
     inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr);
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         std::cerr << "Connection failed" << std::endl;
+        closesocket(sock);
+        cleanupNetwork();
         return 1;
     }
 
@@ -274,13 +296,14 @@ int main() {
     SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
 
     ssl_conn = SSL_new(client_ctx);
-    SSL_set_fd(ssl_conn, sock);
+    SSL_set_fd(ssl_conn, static_cast<int>(sock));
 
     if (SSL_connect(ssl_conn) <= 0) {
         std::cerr << "Secure TLS handshake failed." << std::endl;
         SSL_free(ssl_conn);
-        close(sock);
+        closesocket(sock);
         SSL_CTX_free(client_ctx);
+        cleanupNetwork();
         return 1;
     }
 
@@ -294,14 +317,14 @@ int main() {
 
         CLIENT_LOG = "client_" + my_username + ".log";
         sendCommand(CMD_LOGIN + "|" + my_username);
-
         char buffer[BUFFER_SIZE];
         memset(buffer, 0, BUFFER_SIZE);
         int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
         if (bytes <= 0) {
             SSL_free(ssl_conn);
-            close(sock);
+            closesocket(sock);
             SSL_CTX_free(client_ctx);
+            cleanupNetwork();
             return 1;
         }
 
@@ -315,10 +338,8 @@ int main() {
         }
     }
 
-    pthread_t recv_thread;
-    pthread_create(&recv_thread, NULL, receiveThread, NULL);
+    std::thread recv_thread(receiveThread);
     using_history();
-
     std::string prompt = "[" + my_username + "]: ";
 
     while (running) {
@@ -329,16 +350,18 @@ int main() {
         if (input.empty()) continue;
 
         add_history(input.c_str());
-
         if (input == "/quit") {
+            running = false; // ИСПРАВЛЕНО: Выставляем сразу, чтобы заблокировать перерисовку readline в потоке приёма
             sendCommand(CMD_QUIT);
-            usleep(200000); // 200мс задержка, чтобы поймать Goodbye от сервера до закрытия сокета
-            running = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#ifdef _WIN32
+            shutdown(sock, SD_BOTH);
+#else
             shutdown(sock, SHUT_RDWR);
+#endif
             break;
         }
 
-        // Обновленная команда /help в столбик на английском
         if (input == "/help") {
             std::cout << "\033[A\r\033[K" << COLOR_YELLOW
                 << "--- Available Commands Context Menu ---\n"
@@ -371,7 +394,6 @@ int main() {
         std::string l_text = last_msg_text;
         stateMutex.unlock();
 
-        // Новая команда /clear
         if (input == "/clear") {
             if (!current_partner.empty()) {
                 sendCommand(CMD_CLEAR + "|PM|" + current_partner);
@@ -496,7 +518,6 @@ int main() {
                 }
 
                 std::cout << "\033[A\r\033[K" << std::flush;
-
                 stateMutex.lock();
                 pending_group = gname;
                 stateMutex.unlock();
@@ -514,8 +535,9 @@ int main() {
         SSL_shutdown(ssl_conn);
         SSL_free(ssl_conn);
     }
-    close(sock);
+    closesocket(sock);
     if (client_ctx) SSL_CTX_free(client_ctx);
-    pthread_join(recv_thread, NULL);
+    if (recv_thread.joinable()) recv_thread.join();
+    cleanupNetwork();
     return 0;
 }
