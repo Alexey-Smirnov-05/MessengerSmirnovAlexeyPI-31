@@ -1,3 +1,12 @@
+// client.cpp
+// Команда для сборки в MINGW64 / UCRT64:
+// g++ -D_XOPEN_SOURCE_EXTENDED=1 -DNCURSES_WIDECHAR=1 client.cpp logger.cpp -I/ucrt64/include/ncursesw -lncursesw -lssl -lcrypto -lws2_32 -o client.exe
+// Запуск на Windows: winpty ./client.exe
+// Сборка на Linux:  g++ -D_XOPEN_SOURCE_EXTENDED=1 client.cpp logger.cpp -lncursesw -lssl -lcrypto -pthread -o client
+
+#define _XOPEN_SOURCE_EXTENDED 1
+#define NCURSES_WIDECHAR 1
+
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -6,538 +15,791 @@
 #include <mutex>
 #include <algorithm>
 #include <thread>
+#include <vector>
+#include <cwchar>
+#include <clocale>
 #include <chrono>
 
-// --- НАСТРОЙКА READLINE ДЛЯ WINDOWS И LINUX ---
-#ifndef _WIN32
-#include <readline/readline.h>
-#include <readline/history.h>
+#include <ncursesw/ncurses.h>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
 #else
-    // Заглушки функций readline для Windows, чтобы код компилировался без внешних зависимостей
-inline char* readline(const char* prompt) {
-    std::cout << prompt;
-    std::string s;
-    if (!std::getline(std::cin, s)) return nullptr;
-    char* res = (char*)malloc(s.size() + 1);
-#ifdef _MSC_VER
-    strcpy_s(res, s.size() + 1, s.c_str());
-#else
-    strcpy(res, s.c_str());
-#endif
-    return res;
-}
-inline void add_history(const char*) {}
-inline void using_history() {}
-inline void rl_on_new_line() {}
-inline void rl_redisplay() {}
-inline void rl_cleanup_after_signal() {}
+#  include <arpa/inet.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <sys/select.h>
 #endif
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
 #include "common.h"
 #include "logger.h"
+
+// =============================================================================
+// ГЛОБАЛЬНЫЕ СТРУКТУРЫ И ДАННЫЕ
+// =============================================================================
+
+// Структура для хранения одного сообщения в истории чата
+struct DisplayMessage {
+    std::wstring sender;     // Имя отправителя
+    std::wstring text;       // Текст сообщения
+    int color_pair;          // Цветовая схема сообщения
+    bool is_system;          // Флаг системного уведомления
+};
 
 std::string CLIENT_LOG;
 SOCKET sock = INVALID_SOCKET;
 SSL* ssl_conn = nullptr;
 SSL_CTX* client_ctx = nullptr;
+
+// Флаг работы клиента (atomic для безопасного доступа из разных потоков)
 std::atomic<bool> running(true);
 
-std::string my_username;
-std::string active_chat_partner = "";
-std::string active_group = "";
-std::string pending_group = "";
+std::wstring my_username = L"";
+std::wstring active_chat_partner = L"";
+std::wstring active_group = L"";
+std::wstring pending_group = L"";
 
-std::string last_msg_sender = "";
-std::string last_msg_text = "";
+// Вектор для хранения истории сообщений текущего экрана
+std::vector<DisplayMessage> chat_history;
 
-std::mutex stateMutex;
-#define COLOR_YELLOW  "\033[33m"
-#define COLOR_RED     "\033[31m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_RESET   "\033[0m"
+bool has_forward_buffer = false;
+DisplayMessage forward_buffer;
+
+// Режимы работы пользовательского интерфейса
+enum UiMode { MODE_INPUT, MODE_SELECT };
+UiMode current_mode = MODE_INPUT;
+
+int selected_line_idx = -1;  // Индекс выбранной строки в режиме MODE_SELECT
+int scroll_offset = 0;       // Смещение прокрутки чата
+
+std::mutex stateMutex;       // Мьютекс для защиты состояния (переменных чата)
+std::mutex ncursesMtx;       // Мьютекс для защиты вызовов библиотеки ncurses
+
+// Указатели на окна интерфейса
+WINDOW* header_win = nullptr;
+WINDOW* chat_win = nullptr;
+WINDOW* input_win = nullptr;
+
+std::wstring current_input_string = L"";
+
+// =============================================================================
+// UTF-8 КОНВЕРТЕРЫ (Без устаревшего std::wstring_convert)
+// =============================================================================
+
+std::wstring to_wstring(const std::string& utf8) {
+    std::wstring r;
+    const unsigned char* s = reinterpret_cast<const unsigned char*>(utf8.c_str());
+    size_t i = 0, n = utf8.size();
+    while (i < n) {
+        unsigned char c = s[i];
+        wchar_t cp = 0;
+        if (c < 0x80) { cp = c; i += 1; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < n) { cp = ((c & 0x1F) << 6) | (s[i + 1] & 0x3F); i += 2; }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < n) { cp = ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); i += 3; }
+        else if ((c & 0xF8) == 0xF0 && i + 3 < n) { cp = ((c & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12) | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F); i += 4; }
+        else { i += 1; continue; }
+        r.push_back(cp);
+    }
+    return r;
+}
+
+std::string to_string(const std::wstring& ws) {
+    std::string r;
+    for (wchar_t wc : ws) {
+        unsigned u = (unsigned)wc;
+        if (u < 0x80) { r += (char)u; }
+        else if (u < 0x800) { r += (char)(0xC0 | (u >> 6));   r += (char)(0x80 | (u & 0x3F)); }
+        else if (u < 0x10000) { r += (char)(0xE0 | (u >> 12));  r += (char)(0x80 | ((u >> 6) & 0x3F));  r += (char)(0x80 | (u & 0x3F)); }
+        else { r += (char)(0xF0 | (u >> 18));  r += (char)(0x80 | ((u >> 12) & 0x3F)); r += (char)(0x80 | ((u >> 6) & 0x3F)); r += (char)(0x80 | (u & 0x3F)); }
+    }
+    return r;
+}
+
+// =============================================================================
+// ЧТЕНИЕ КЛАВИАТУРЫ (КРОССПЛАТФОРМЕННЫЙ ФИКС КИРИЛЛИЦЫ)
+// =============================================================================
+
+static int read_key() {
+    wint_t ch = 0;
+    int res = wget_wch(stdscr, &ch);
+
+    if (res == ERR) return 0;
+
+    bool is_known_special = (
+        ch == (wint_t)KEY_UP || ch == (wint_t)KEY_DOWN ||
+        ch == (wint_t)KEY_LEFT || ch == (wint_t)KEY_RIGHT ||
+        ch == (wint_t)KEY_BACKSPACE || ch == (wint_t)KEY_DC ||
+        ch == (wint_t)KEY_HOME || ch == (wint_t)KEY_END ||
+        ch == (wint_t)KEY_PPAGE || ch == (wint_t)KEY_NPAGE ||
+        ch == (wint_t)KEY_ENTER || ch == (wint_t)KEY_RESIZE ||
+        (ch >= (wint_t)KEY_F(1) && ch <= (wint_t)KEY_F(12))
+        );
+
+    if (res == KEY_CODE_YES) {
+        if (!is_known_special && ch >= 32) {
+            return (int)ch;  // Возвращаем Юникод код кириллицы
+        }
+        if (ch == (wint_t)KEY_BACKSPACE || ch == (wint_t)KEY_DC) return -KEY_BACKSPACE;
+        if (ch == (wint_t)KEY_UP)     return -KEY_UP;
+        if (ch == (wint_t)KEY_DOWN)   return -KEY_DOWN;
+        if (ch == (wint_t)KEY_LEFT)   return -KEY_LEFT;
+        if (ch == (wint_t)KEY_RIGHT)  return -KEY_RIGHT;
+        if (ch == (wint_t)KEY_F(2))   return -KEY_F(2);
+        if (ch == (wint_t)KEY_RESIZE) return -KEY_RESIZE;
+        if (ch == (wint_t)KEY_ENTER)  return '\n';
+        return 0;
+    }
+
+    if (ch == 27) return -27;        // ESC
+    if (ch == '\n' || ch == '\r') return '\n';
+    if (ch == 127 || ch == 8) return -KEY_BACKSPACE;
+    if (ch >= 32) return (int)ch;
+    return 0;
+}
+
+// =============================================================================
+// ТАЙМАУТ ПОДКЛЮЧЕНИЯ (Неблокирующий connect)
+// =============================================================================
+
+bool connectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen, int timeout_sec) {
+#ifdef _WIN32
+    unsigned long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    connect(s, addr, addrlen);
+
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(s, &writeSet);
+    timeval tv;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
+
+    int res = select(static_cast<int>(s + 1), nullptr, &writeSet, nullptr, &tv);
+
+#ifdef _WIN32
+    mode = 0;
+    ioctlsocket(s, FIONBIO, &mode);
+#else
+    fcntl(s, F_SETFL, flags);
+#endif
+
+    return (res > 0 && FD_ISSET(s, &writeSet));
+}
+
+// =============================================================================
+// UI ОТРИСОВКА И ОБНОВЛЕНИЕ ЭКРАНА
+// =============================================================================
+
+int getWStringDisplayWidth(const std::wstring& ws) {
+    if (ws.empty()) return 0;
+#ifndef _WIN32
+    int w = wcswidth(ws.c_str(), ws.size());
+    if (w >= 0) return w;
+#endif
+    return (int)ws.size();
+}
+
+void updateHeader() {
+    if (!header_win) return;
+    werase(header_win);
+
+    // Белая шапка с черным жирным текстом для высокой читаемости на Windows
+    wattron(header_win, COLOR_PAIR(5) | A_BOLD);
+    int my, mx; getmaxyx(header_win, my, mx); (void)my;
+
+    std::wstring s = L" Secure Messenger | User: " + my_username;
+    if (!active_chat_partner.empty()) s += L" | Chat: " + active_chat_partner;
+    else if (!active_group.empty())   s += L" | Group: " + active_group;
+    else                              s += L" | Main Menu";
+
+    if (current_mode == MODE_SELECT)  s += L" | [SELECT MODE: Arrows, R-Reply, F-Forward, ESC-Exit]";
+    else                              s += L" | [F2-Select Mode]";
+
+    if (has_forward_buffer)           s += L" | (FWD Ready)";
+
+    int dw = getWStringDisplayWidth(s);
+    if (dw < mx) s.append(mx - dw, L' '); else s = s.substr(0, mx);
+
+    mvwaddwstr(header_win, 0, 0, s.c_str());
+    wattroff(header_win, COLOR_PAIR(5) | A_BOLD);
+    wnoutrefresh(header_win);
+}
+
+void updateInputWin() {
+    if (!input_win) return;
+    werase(input_win);
+    if (current_mode == MODE_SELECT) {
+        mvwaddwstr(input_win, 0, 0, L"[SELECT MODE] Use Up/Down arrows. Press ESC to cancel.");
+    }
+    else {
+        std::wstring p = L"[" + my_username + L"]: ";
+        mvwaddwstr(input_win, 0, 0, p.c_str());
+        waddwstr(input_win, current_input_string.c_str());
+        wmove(input_win, 0, getWStringDisplayWidth(p) + getWStringDisplayWidth(current_input_string));
+    }
+    wnoutrefresh(input_win);
+}
+
+void redrawChatWindow() {
+    if (!chat_win) return;
+    werase(chat_win);
+    int my, mx; getmaxyx(chat_win, my, mx);
+    if (chat_history.empty()) { wnoutrefresh(chat_win); return; }
+    int total = (int)chat_history.size();
+    if (current_mode == MODE_INPUT)
+        scroll_offset = (total > my) ? total - my : 0;
+    scroll_offset = std::max(0, std::min(scroll_offset, (total > my ? total - my : 0)));
+    int row = 0;
+    for (int i = scroll_offset; i < std::min(scroll_offset + my, total); ++i, ++row) {
+        bool sel = (current_mode == MODE_SELECT && i == selected_line_idx);
+        wmove(chat_win, row, 0); wclrtoeol(chat_win);
+        if (sel) wattron(chat_win, A_STANDOUT);
+
+        // ЦВЕТОВАЯ ДИФФЕРЕНЦИАЦИЯ: Свои сообщения — Ярко-желтые, Собеседника — Белые
+        int color = chat_history[i].color_pair;
+        if (!chat_history[i].is_system) {
+            if (chat_history[i].sender == my_username) {
+                color = 1; // Желтый цвет для моих сообщений
+            }
+            else {
+                color = 6; // Белый цвет для сообщений других пользователей
+            }
+        }
+
+        if (color > 0) wattron(chat_win, COLOR_PAIR(color));
+        std::wstring line = chat_history[i].is_system
+            ? chat_history[i].text
+            : L"[" + chat_history[i].sender + L"]: " + chat_history[i].text;
+        if (getWStringDisplayWidth(line) > mx) line = line.substr(0, mx - 3) + L"...";
+        mvwaddwstr(chat_win, row, 0, line.c_str());
+        if (color > 0) wattroff(chat_win, COLOR_PAIR(color));
+        if (sel) wattroff(chat_win, A_STANDOUT);
+    }
+    wnoutrefresh(chat_win);
+}
+
+void triggerGlobalUpdate() {
+    std::lock_guard<std::mutex> lk(ncursesMtx);
+    updateHeader(); redrawChatWindow(); updateInputWin();
+    curs_set(current_mode == MODE_INPUT ? 1 : 0);
+    doupdate();
+}
+
+void pushMessageToHistory(const std::wstring& sender, const std::wstring& text,
+    bool is_system = false, int color_pair = 0) {
+    std::lock_guard<std::mutex> lk(stateMutex);
+    chat_history.push_back({ sender, text, color_pair, is_system });
+    if (current_mode == MODE_INPUT)
+        selected_line_idx = (int)chat_history.size() - 1;
+}
+
+void resizeUI() {
+    std::lock_guard<std::mutex> lk(stateMutex);
+    int my, mx; getmaxyx(stdscr, my, mx);
+    if (my < 5 || mx < 20) return;
+
+    // Очищаем главный экран для предотвращения артефактов ("бегающего текста") при масштабировании
+    clear();
+    refresh();
+
+    wresize(header_win, 1, mx);
+    wresize(chat_win, my - 3, mx);
+    wresize(input_win, 2, mx);
+    mvwin(input_win, my - 2, 0);
+    stateMutex.unlock();
+    triggerGlobalUpdate();
+    stateMutex.lock();
+}
+
+// =============================================================================
+// СЕТЕВАЯ ЛОГИКА И СЕТЬ
+// =============================================================================
 
 bool sendCommand(const std::string& cmd) {
     if (!ssl_conn) return false;
-    std::string msg = cmd + "\n";
-    int sent = SSL_write(ssl_conn, msg.c_str(), static_cast<int>(msg.length()));
-    return sent > 0;
+    std::string m = cmd + "\n";
+    return SSL_write(ssl_conn, m.c_str(), (int)m.size()) > 0;
 }
 
 void processIncomingPacket(const std::string& data) {
     std::istringstream iss(data);
-    std::string cmd;
-    std::getline(iss, cmd, '|');
-
-    bool need_display_update = false;
-    std::string output_to_print = "";
+    std::string cmd; std::getline(iss, cmd, '|');
 
     if (cmd == CMD_INMSG) {
-        std::string from, msg;
-        std::getline(iss, from, '|');
-        std::getline(iss, msg);
+        std::string from, msg; std::getline(iss, from, '|'); std::getline(iss, msg);
 
-        stateMutex.lock();
-        std::string current_partner = active_chat_partner;
-        last_msg_sender = from;
-        last_msg_text = msg;
-        stateMutex.unlock();
-        if (from == current_partner) {
-            output_to_print = "[" + from + "]: " + msg;
-        }
-        else {
-            output_to_print = std::string(COLOR_GREEN) + "[Notification]: PM from " + from + ": " + msg + COLOR_RESET;
-        }
-        logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
-        need_display_update = true;
-    }
-    else if (cmd == CMD_ONLINE_LIST) {
-        std::string list_str;
-        std::getline(iss, list_str);
-        std::istringstream oiss(list_str);
-        std::string uname;
-
-        output_to_print = std::string(COLOR_YELLOW) + "--- Users Online ---" + COLOR_RESET;
-        while (std::getline(oiss, uname, ',')) {
-            if (!uname.empty()) {
-                output_to_print += "\n" + uname;
+        // ФИКС КРОСС-СИНХРОНИЗАЦИИ: Используем find() вместо == на случай присутствия невидимого \r
+        if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") != std::string::npos) {
+            std::lock_guard<std::mutex> lk(stateMutex);
+            if (to_wstring(from) == active_chat_partner) {
+                chat_history.clear();
+                chat_history.push_back({ L"System", L"[Chat history cleared by partner]", 2, true });
+                selected_line_idx = -1;
+                scroll_offset = 0;
             }
         }
-        output_to_print += std::string(COLOR_YELLOW) + "\n--------------------" + COLOR_RESET;
-        need_display_update = true;
+        else {
+            stateMutex.lock(); std::wstring cp = active_chat_partner; stateMutex.unlock();
+            if (to_wstring(from) == cp)
+                pushMessageToHistory(to_wstring(from), to_wstring(msg));
+            else
+                pushMessageToHistory(L"System", L"[Message from " + to_wstring(from) + L"]: " + to_wstring(msg), true, 2);
+            logMessage(CLIENT_LOG, "IN", "From " + from + ": " + msg);
+        }
+    }
+    else if (cmd == CMD_ONLINE_LIST) {
+        std::string list; std::getline(iss, list);
+        std::istringstream oi(list); std::string u;
+        pushMessageToHistory(L"System", L"--- Online Users ---", true, 4);
+        while (std::getline(oi, u, ',')) if (!u.empty()) pushMessageToHistory(L"System", to_wstring(u), true, 6);
+        pushMessageToHistory(L"System", L"--------------------", true, 4);
     }
     else if (cmd == CMD_GROUP_MSG) {
-        std::string gname, from, msg;
-        std::getline(iss, gname, '|');
-        std::getline(iss, from, '|');
-        std::getline(iss, msg);
+        std::string gn, from, msg;
+        std::getline(iss, gn, '|'); std::getline(iss, from, '|'); std::getline(iss, msg);
 
-        stateMutex.lock();
-        std::string current_group = active_group;
-        last_msg_sender = from;
-        last_msg_text = msg;
-        stateMutex.unlock();
-        if (gname == current_group) {
-            output_to_print = "[" + from + "]: " + msg;
+        // ФИКС КРОСС-СИНХРОНИЗАЦИИ В ГРУППЕ: Используем find() вместо == на случай присутствия невидимого \r
+        if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") != std::string::npos) {
+            std::lock_guard<std::mutex> lk(stateMutex);
+            if (to_wstring(gn) == active_group) {
+                chat_history.clear();
+                chat_history.push_back({ L"System", L"[Chat history cleared by partner]", 2, true });
+                selected_line_idx = -1;
+                scroll_offset = 0;
+            }
         }
         else {
-            output_to_print = std::string(COLOR_GREEN) + "[Notification]: New in " + gname + " from " + from + ": " + msg + COLOR_RESET;
+            stateMutex.lock(); std::wstring cg = active_group; stateMutex.unlock();
+            if (to_wstring(gn) == cg)
+                pushMessageToHistory(to_wstring(from), to_wstring(msg));
+            else
+                pushMessageToHistory(L"System", L"[Group " + to_wstring(gn) + L" / " + to_wstring(from) + L"]: " + to_wstring(msg), true, 2);
+            logMessage(CLIENT_LOG, "G_IN", "[" + gn + "] " + from + ": " + msg);
         }
-        logMessage(CLIENT_LOG, "G_IN", "[" + gname + "] " + from + ": " + msg);
-        need_display_update = true;
     }
     else if (cmd == CMD_HIST_LINE) {
-        std::string type;
-        std::getline(iss, type, '|');
+        std::string type; std::getline(iss, type, '|');
         if (type == "PM") {
-            std::string from, msg;
-            std::getline(iss, from, '|');
-            std::getline(iss, msg);
-            output_to_print = "[" + from + "]: " + msg;
-            need_display_update = true;
+            std::string from, msg; std::getline(iss, from, '|'); std::getline(iss, msg);
+            pushMessageToHistory(to_wstring(from), to_wstring(msg));
         }
         else if (type == "GROUP") {
-            std::string gname, from, msg;
-            std::getline(iss, gname, '|');
-            std::getline(iss, from, '|');
-            std::getline(iss, msg);
-            output_to_print = "[" + from + "]: " + msg;
-            need_display_update = true;
+            std::string gn, from, msg;
+            std::getline(iss, gn, '|'); std::getline(iss, from, '|'); std::getline(iss, msg);
+            pushMessageToHistory(to_wstring(from), to_wstring(msg));
         }
     }
     else if (cmd == CMD_GROUP_NOTIFY) {
-        std::string type, gname;
-        std::getline(iss, type, '|');
-        std::getline(iss, gname, '|');
-
+        std::string type, gn; std::getline(iss, type, '|'); std::getline(iss, gn, '|');
         stateMutex.lock();
-        if (type == "KICKED") {
-            std::string admin;
-            std::getline(iss, admin);
-            if (active_group == gname) {
-                active_group = "";
-                output_to_print = std::string(COLOR_RED) + "\n[You were removed from group " + gname + " by admin " + admin + "]" + COLOR_RESET + "\n========================================";
-            }
-            else {
-                output_to_print = std::string(COLOR_RED) + "[Notification]: Admin " + admin + " removed you from group " + gname + COLOR_RESET;
-            }
-            need_display_update = true;
+        if (type == "KICKED" && active_group == to_wstring(gn))
+        {
+            active_group = L""; pushMessageToHistory(L"System", L"[You were kicked from group " + to_wstring(gn) + L"]", true, 3);
         }
-        else if (type == "DELETED") {
-            if (active_group == gname) {
-                active_group = "";
-                output_to_print = std::string(COLOR_RED) + "\n[Group " + gname + " was deleted by admin]" + COLOR_RESET + "\n========================================";
-            }
-            else {
-                output_to_print = std::string(COLOR_RED) + "[Notification]: Group " + gname + " deleted by admin." + COLOR_RESET;
-            }
-            need_display_update = true;
-        }
-        else if (type == "ADDED") {
-            std::string admin;
-            std::getline(iss, admin);
-            output_to_print = std::string(COLOR_GREEN) + "[Notification]: Admin " + admin + " added you to group " + gname + " (You can now join it)" + COLOR_RESET;
-            need_display_update = true;
+        else if (type == "DELETED" && active_group == to_wstring(gn))
+        {
+            active_group = L""; pushMessageToHistory(L"System", L"[Group " + to_wstring(gn) + L" was deleted by admin]", true, 3);
         }
         stateMutex.unlock();
     }
     else if (cmd == CMD_OK) {
-        std::string info;
-        std::getline(iss, info);
-
+        std::string info; std::getline(iss, info);
         stateMutex.lock();
-        if (!pending_group.empty() && (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
-            active_group = pending_group;
-            std::string gname = active_group;
-            pending_group = "";
+        if (!pending_group.empty() &&
+            (info.find("Group created") != std::string::npos || info.find("Joined group") != std::string::npos)) {
+            active_group = pending_group; std::wstring gn = active_group; pending_group = L"";
             stateMutex.unlock();
-
-            output_to_print = "\n========================================\n Group Chat: " + gname + "\n========================================\nAdmin commands: /add <name>, /delete <name>, /delete_group\nType /exit to leave\n";
-            need_display_update = true;
+            chat_history.clear(); selected_line_idx = -1; scroll_offset = 0;
+            // Убрана дублирующая системная строка "=== Группа ===", так как имя группы уже выводится в верхней шапке (Header)
+            sendCommand(CMD_REQ_HISTORY + "|GROUP|" + to_string(gn));
         }
-        else {
-            stateMutex.unlock();
-            if (info != "Message sent" && info != "Group message sent") {
-                output_to_print = COLOR_YELLOW + std::string("[Server]: ") + info + COLOR_RESET;
-                need_display_update = true;
-            }
-        }
-        logMessage(CLIENT_LOG, "INFO", info);
+        else { stateMutex.unlock(); }
     }
     else if (cmd == CMD_ERROR) {
-        std::string err;
-        std::getline(iss, err);
-        output_to_print = COLOR_RED + std::string("[Error]: ") + err + COLOR_RESET;
-        need_display_update = true;
-
-        stateMutex.lock();
-        pending_group = "";
-        // ИСПРАВЛЕНО: Больше не сбрасываем active_group = "", чтобы пользователя не выкидывало из чата при ошибках!
-        stateMutex.unlock();
+        std::string err; std::getline(iss, err);
+        pushMessageToHistory(L"Error", to_wstring(err), true, 3);
+        std::lock_guard<std::mutex> lk(stateMutex); pending_group = L"";
     }
+    // СИНХРОННАЯ ОЧИСТКА ЭКРАНА: Если от сервера напрямую прилетела команда CLEAR
+    else if (cmd == CMD_CLEAR) {
+        std::string clear_type, sender_or_group;
+        std::getline(iss, clear_type, '|');
+        std::getline(iss, sender_or_group);
+        std::wstring target = to_wstring(sender_or_group);
 
-    // ИСПРАВЛЕНО: Печатаем ответ сервера всегда, но обновляем readline-промпт только если работа продолжается
-    if (need_display_update) {
-        std::cout << "\r\033[K" << output_to_print << std::endl;
-        if (running) {
-            rl_on_new_line();
-            rl_redisplay();
+        std::lock_guard<std::mutex> lk(stateMutex);
+        bool needs_local_clear = false;
+
+        // Если это личный чат, и имя собеседника совпадает с тем, кто очистил, либо с моим именем (для надежной кросс-маршрутизации сервера)
+        if (clear_type == "PM" && (target == active_chat_partner || target == my_username)) {
+            needs_local_clear = true;
+        }
+        // Если это групповой чат, и мы находимся в этой группе
+        else if (clear_type == "GROUP" && target == active_group) {
+            needs_local_clear = true;
+        }
+
+        if (needs_local_clear) {
+            chat_history.clear();
+            chat_history.push_back({ L"System", L"[Chat history cleared by partner]", 2, true });
+            selected_line_idx = -1;
+            scroll_offset = 0;
         }
     }
+    triggerGlobalUpdate();
 }
 
 void receiveThread() {
-    char buffer[BUFFER_SIZE];
-    std::string stream_buffer = "";
+    char buf[BUFFER_SIZE]; std::string sbuf;
     while (running) {
-        memset(buffer, 0, BUFFER_SIZE);
-        int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
-        if (bytes <= 0) {
-            if (running) {
-                std::cout << "\r\033[K" << COLOR_RED << "\n[Disconnected from server]" << COLOR_RESET << std::endl;
-                running = false;
-            }
+        memset(buf, 0, BUFFER_SIZE);
+        int n = SSL_read(ssl_conn, buf, BUFFER_SIZE - 1);
+        if (n <= 0) {
+            if (running) { pushMessageToHistory(L"System", L"[Connection to server lost]", true, 3); triggerGlobalUpdate(); running = false; }
             break;
         }
-
-        stream_buffer += std::string(buffer, bytes);
+        sbuf += std::string(buf, n);
         size_t pos;
-        while ((pos = stream_buffer.find('\n')) != std::string::npos) {
-            std::string packet = stream_buffer.substr(0, pos);
-            stream_buffer.erase(0, pos + 1);
+        while ((pos = sbuf.find('\n')) != std::string::npos) {
+            std::string pkt = sbuf.substr(0, pos); sbuf.erase(0, pos + 1);
 
-            packet.erase(std::remove(packet.begin(), packet.end(), '\r'), packet.end());
-            if (!packet.empty()) {
-                processIncomingPacket(packet);
+            // ФИКС КАРЕТКИ: Обязательно отсекаем символ \r, иначе он сломает сравнения строк и парсинг команд
+            if (!pkt.empty() && pkt.back() == '\r') {
+                pkt.pop_back();
             }
+
+            if (!pkt.empty()) processIncomingPacket(pkt);
         }
     }
 }
 
-int main() {
-    if (!initNetwork()) {
-        std::cerr << "Failed to init network architecture." << std::endl;
-        return 1;
-    }
+// =============================================================================
+// ОБРАБОТКА КОМАНД ПОЛЬЗОВАТЕЛЯ
+// =============================================================================
 
-    std::string server_ip;
+void handleOutboundCommand(const std::wstring& wi) {
+    std::string input = to_string(wi);
+    if (input == "/quit") { running = false; sendCommand(CMD_QUIT); return; }
+    if (input == "/online") { sendCommand(CMD_REQ_ONLINE); return; }
+
+    // СТРОГОЕ СООТВЕТСТВИЕ КОМАНД В СПРАВКЕ РЕАЛЬНОМУ ФУНКЦИОНАЛУ
+    if (input == "/help") {
+        pushMessageToHistory(L"System", L"--- Active Commands ---", true, 4);
+        pushMessageToHistory(L"System", L"/chat [user]   - Open a private chat with a user", true, 4);
+        pushMessageToHistory(L"System", L"/group [#name] - Join or create a group channel", true, 4);
+        pushMessageToHistory(L"System", L"/add [user]    - Add a user to the current group", true, 4);
+        pushMessageToHistory(L"System", L"/delete [user] - Kick a user from the current group", true, 4);
+        pushMessageToHistory(L"System", L"/delete_group  - Delete the current group", true, 4);
+        pushMessageToHistory(L"System", L"/online        - Get the list of online users", true, 4);
+        pushMessageToHistory(L"System", L"/clear         - Clear the chat screen locally", true, 4);
+        pushMessageToHistory(L"System", L"/exit          - Leave the current private chat or group", true, 4);
+        pushMessageToHistory(L"System", L"/quit          - Exit the messenger application", true, 4);
+        pushMessageToHistory(L"System", L"Press F2 to enter Select Mode (Scroll, Reply 'R', Forward 'F')", true, 2);
+        triggerGlobalUpdate(); return;
+    }
+    stateMutex.lock(); std::wstring cp = active_chat_partner, cg = active_group; stateMutex.unlock();
+
+    // ИСПРАВЛЕННЫЙ /CLEAR БЕЗ DEADLOCK (Блокировка stateMutex теперь освобождается корректно)
+    if (input == "/clear") {
+        {
+            std::lock_guard<std::mutex> lk(stateMutex);
+            chat_history.clear();
+            chat_history.push_back({ L"System", L"[Chat history cleared locally]", 2, true });
+            selected_line_idx = -1;
+            scroll_offset = 0;
+        }
+        triggerGlobalUpdate();
+
+        if (!cp.empty()) {
+            sendCommand(CMD_CLEAR + "|PM|" + to_string(cp));
+            // Отсылаем партнеру в реальном времени скрытое управляющее сообщение для мгновенного очищения экрана
+            sendCommand(CMD_MSG + "|" + to_string(cp) + "|_SYSTEM_CHAT_CLEAR_REQUEST_");
+        }
+        else if (!cg.empty()) {
+            sendCommand(CMD_CLEAR + "|GROUP|" + to_string(cg));
+            // Отсылаем во всю группу скрытое управляющее сообщение для мгновенного очищения экрана
+            sendCommand(CMD_GROUP_MSG + "|" + to_string(cg) + "|_SYSTEM_CHAT_CLEAR_REQUEST_");
+        }
+        return;
+    }
+    if (!cp.empty()) {
+        if (input == "/exit") {
+            pushMessageToHistory(L"System", L"[Left chat with " + cp + L"]", true, 4);
+            std::lock_guard<std::mutex> lk(stateMutex);
+            active_chat_partner = L""; chat_history.clear(); selected_line_idx = -1; scroll_offset = 0;
+            return;
+        }
+        pushMessageToHistory(my_username, wi); // Мои отправленные сообщения будут желтыми
+        sendCommand(CMD_MSG + "|" + to_string(cp) + "|" + input);
+    }
+    else if (!cg.empty()) {
+        if (input == "/exit") {
+            pushMessageToHistory(L"System", L"[Left group]", true, 4);
+            std::lock_guard<std::mutex> lk(stateMutex);
+            active_group = L""; chat_history.clear(); selected_line_idx = -1; scroll_offset = 0;
+            return;
+        }
+        if (input.rfind("/add ", 0) == 0) { sendCommand(CMD_GROUP_ADD + "|" + to_string(cg) + "|" + input.substr(5)); return; }
+        if (input.rfind("/delete ", 0) == 0) { sendCommand(CMD_GROUP_KICK + "|" + to_string(cg) + "|" + input.substr(8)); return; }
+        if (input == "/delete_group") { sendCommand(CMD_GROUP_DEL + "|" + to_string(cg)); return; }
+        pushMessageToHistory(my_username, wi);
+        sendCommand(CMD_GROUP_MSG + "|" + to_string(cg) + "|" + input);
+    }
+    else {
+        if (input.rfind("/chat ", 0) == 0) {
+            std::string t = input.substr(6);
+            if (to_wstring(t) == my_username) return;
+            stateMutex.lock(); active_chat_partner = to_wstring(t); chat_history.clear(); selected_line_idx = -1; scroll_offset = 0; stateMutex.unlock();
+
+            // Убрана бессмысленная системная строка "=== Чат с: ... ===" (название уже отображается на верхней панели)
+            sendCommand(CMD_REQ_HISTORY + "|PM|" + t);
+        }
+        else if (input.rfind("/group ", 0) == 0) {
+            std::string gn = input.substr(7);
+            if (gn.empty() || gn[0] != '#') { pushMessageToHistory(L"System", L"Group name must start with '#'", true, 3); return; }
+            std::lock_guard<std::mutex> lk(stateMutex); pending_group = to_wstring(gn);
+            sendCommand(CMD_GROUP_JOIN + "|" + gn);
+        }
+        else {
+            pushMessageToHistory(L"System", L"Type /chat <name>, /group <#name>, /online or /help", true, 4);
+        }
+    }
+}
+
+// =============================================================================
+// ВВОД НА ЭКРАНАХ ЛОГИНА/IP
+// =============================================================================
+
+std::wstring readSimpleInput(const std::wstring& prompt, const std::wstring& err_msg = L"") {
+    std::wstring input;
     while (true) {
-        char* input_ip = readline("Enter server IP (or 'localhost'): ");
-        if (!input_ip) { cleanupNetwork(); return 0; }
-        server_ip = input_ip;
-        free(input_ip);
-        if (server_ip == "localhost" || server_ip == "127.0.0.1") {
-            server_ip = "127.0.0.1";
-            break;
-        }
-        struct sockaddr_in test;
-        if (inet_pton(AF_INET, server_ip.c_str(), &test.sin_addr) == 1) break;
-        std::cout << COLOR_RED << "[Error]: Invalid IP address." << COLOR_RESET << std::endl;
+        werase(stdscr);
+        if (!err_msg.empty()) { attron(COLOR_PAIR(3)); mvaddwstr(1, 2, err_msg.c_str()); attroff(COLOR_PAIR(3)); }
+        mvaddwstr(3, 2, prompt.c_str());
+        mvaddwstr(4, 2, input.c_str());
+        curs_set(1);
+        move(4, 2 + getWStringDisplayWidth(input));
+        refresh();
+        int k = read_key();
+        if (k == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+        if (k == '\n') return input;
+        if (k == -KEY_BACKSPACE) { if (!input.empty()) input.pop_back(); continue; }
+        if (k == -27) continue;
+        if (k > 0 && k >= 32) input.push_back((wchar_t)k);
     }
+}
 
-    struct sockaddr_in serv_addr;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) { cleanupNetwork(); return 1; }
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(DEFAULT_PORT);
-    inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr);
+// =============================================================================
+// MAIN (ТОЧКА ВХОДА)
+// =============================================================================
 
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::cerr << "Connection failed" << std::endl;
-        closesocket(sock);
-        cleanupNetwork();
-        return 1;
-    }
-
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-    client_ctx = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
-
-    ssl_conn = SSL_new(client_ctx);
-    SSL_set_fd(ssl_conn, static_cast<int>(sock));
-
-    if (SSL_connect(ssl_conn) <= 0) {
-        std::cerr << "Secure TLS handshake failed." << std::endl;
-        SSL_free(ssl_conn);
-        closesocket(sock);
-        SSL_CTX_free(client_ctx);
-        cleanupNetwork();
-        return 1;
-    }
-
-    bool logged_in = false;
-    while (!logged_in) {
-        char* name_input = readline("Enter your username: ");
-        if (!name_input) break;
-        my_username = name_input;
-        free(name_input);
-        if (my_username.empty()) continue;
-
-        CLIENT_LOG = "client_" + my_username + ".log";
-        sendCommand(CMD_LOGIN + "|" + my_username);
-        char buffer[BUFFER_SIZE];
-        memset(buffer, 0, BUFFER_SIZE);
-        int bytes = SSL_read(ssl_conn, buffer, BUFFER_SIZE - 1);
-        if (bytes <= 0) {
-            SSL_free(ssl_conn);
-            closesocket(sock);
-            SSL_CTX_free(client_ctx);
-            cleanupNetwork();
-            return 1;
-        }
-
-        std::string response(buffer);
-        if (response.find(CMD_OK) == 0) {
-            std::cout << COLOR_YELLOW << "[Server]: Logged in as " << my_username << COLOR_RESET << std::endl;
-            logged_in = true;
-        }
-        else {
-            std::cout << COLOR_RED << "[Error]: Login failed or name taken." << COLOR_RESET << std::endl;
-        }
-    }
-
-    std::thread recv_thread(receiveThread);
-    using_history();
-    std::string prompt = "[" + my_username + "]: ";
-
-    while (running) {
-        char* line = readline(prompt.c_str());
-        if (!line) break;
-        std::string input(line);
-        free(line);
-        if (input.empty()) continue;
-
-        add_history(input.c_str());
-        if (input == "/quit") {
-            running = false; // ИСПРАВЛЕНО: Выставляем сразу, чтобы заблокировать перерисовку readline в потоке приёма
-            sendCommand(CMD_QUIT);
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+int main() {
+    // --- Локаль ДО initscr ---
 #ifdef _WIN32
-            shutdown(sock, SD_BOTH);
+    // Полная очистка консоли Windows для запрета скролла вверх до предыдущих команд консоли
+    system("cls");
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    _putenv("LANG=ru_RU.UTF-8");
+    const char* locs[] = { "ru_RU.UTF-8", "en_US.UTF-8", "C.UTF-8", ".UTF-8", "", nullptr };
+    for (int i = 0; locs[i]; ++i) if (setlocale(LC_ALL, locs[i])) break;
 #else
-            shutdown(sock, SHUT_RDWR);
+    setlocale(LC_ALL, "");
 #endif
-            break;
-        }
 
-        if (input == "/help") {
-            std::cout << "\033[A\r\033[K" << COLOR_YELLOW
-                << "--- Available Commands Context Menu ---\n"
-                << "/chat [username]   - Open private message session with a user\n"
-                << "/group [#name]     - Create or enter a group channel (must start with #)\n"
-                << "/online            - Fetch list of all active users in a column\n"
-                << "/clear             - Delete entire chat history log files permanently\n"
-                << "/exit              - Close current active chat context menu safely\n"
-                << "/quit              - Shut down the client session and disconnect\n"
-                << "/reply [text]      - Fast quote reply to the last incoming message\n"
-                << "/forward           - Forward the last received text to this chat channel\n"
-                << "\n--- Special Group Admin Commands ---\n"
-                << "/add [username]    - Invite and bind user to this private group\n"
-                << "/delete [username] - Kick/remove member from group access list\n"
-                << "/delete_group      - Completely drop group stack and destroy its backup file\n"
-                << "----------------------------------------"
-                << COLOR_RESET << std::endl;
+    // --- Инициализация ncurses ---
+    initscr();
+    set_escdelay(25);
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    meta(stdscr, TRUE);
+    start_color();
+
+    // Настройка цветовой палитры
+    init_pair(1, COLOR_YELLOW, COLOR_BLACK); // Мои отправленные сообщения (Желтые)
+    init_pair(2, COLOR_GREEN, COLOR_BLACK); // Системный успех/уведомления
+    init_pair(3, COLOR_RED, COLOR_BLACK); // Системные ошибки
+    init_pair(4, COLOR_CYAN, COLOR_BLACK); // Информационные логи/справка
+    init_pair(5, COLOR_BLACK, COLOR_WHITE); // Черный текст на белом фоне для Header Windows
+    init_pair(6, COLOR_WHITE, COLOR_BLACK); // Сообщения собеседника (Белые)
+
+    // --- Экран ввода IP ---
+    std::wstring err_ip;
+    std::string  server_ip = "127.0.0.1";
+    while (true) {
+        std::wstring tip = readSimpleInput(L"Enter server IP (Enter = 127.0.0.1):", err_ip);
+        server_ip = to_string(tip);
+        if (server_ip.empty() || server_ip == "localhost") server_ip = "127.0.0.1";
+
+        if (!initNetwork()) { endwin(); std::cerr << "Network init error\n"; return 1; }
+
+        struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET; sa.sin_port = htons(DEFAULT_PORT);
+        if (inet_pton(AF_INET, server_ip.c_str(), &sa.sin_addr) <= 0)
+        {
+            err_ip = L"Invalid IP address format! Please try again."; cleanupNetwork(); continue;
+        }
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+
+        // Быстрое подключение с таймаутом в 2 секунды вместо блокирующего ожидания операционной системы
+        if (!connectWithTimeout(sock, (struct sockaddr*)&sa, sizeof(sa), 2))
+        {
+            err_ip = L"No connection to " + to_wstring(server_ip) + L". Is the server running?"; closesocket(sock); cleanupNetwork(); continue;
+        }
+        break;
+    }
+
+    // --- TLS шифрование ---
+    SSL_load_error_strings(); OpenSSL_add_ssl_algorithms();
+    client_ctx = SSL_CTX_new(TLS_client_method());
+    ssl_conn = SSL_new(client_ctx);
+    SSL_set_fd(ssl_conn, (int)sock);
+    if (SSL_connect(ssl_conn) <= 0) {
+        endwin(); SSL_free(ssl_conn); closesocket(sock); SSL_CTX_free(client_ctx);
+        std::cerr << "SSL Handshake failed\n"; return 1;
+    }
+
+    // --- Экран авторизации (Никнейм) ---
+    std::wstring err_user;
+    while (true) {
+        std::wstring wu = readSimpleInput(L"Enter your username:", err_user);
+        if (wu.empty()) { err_user = L"Username cannot be empty!"; continue; }
+        my_username = wu;
+        std::string ru = to_string(wu);
+        CLIENT_LOG = "client_" + ru + ".log";
+        sendCommand(CMD_LOGIN + "|" + ru);
+
+        char buf[BUFFER_SIZE]; memset(buf, 0, BUFFER_SIZE);
+        int rb = SSL_read(ssl_conn, buf, BUFFER_SIZE - 1);
+        if (rb > 0) {
+            std::string resp(buf, rb);
+            if (resp.find(CMD_ERROR) == 0) {
+                size_t sep = resp.find('|');
+                err_user = L"Error: " + to_wstring(sep != std::string::npos ? resp.substr(sep + 1) : resp);
+                continue;
+            }
+        }
+        break;
+    }
+
+    // --- Инициализация окон ---
+    int my, mx; getmaxyx(stdscr, my, mx);
+    header_win = newwin(1, mx, 0, 0);
+    chat_win = newwin(my - 3, mx, 1, 0);
+    input_win = newwin(2, mx, my - 2, 0);
+    scrollok(chat_win, FALSE);
+
+    triggerGlobalUpdate();
+    std::thread recv_thread(receiveThread);
+
+    // -----------------------------------------------------------------------
+    // ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ СОБЫТИЙ
+    // -----------------------------------------------------------------------
+    while (running) {
+        int k = read_key();
+        if (k == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
+
+        // Функциональные клавиши (k < 0)
+        if (k < 0) {
+            int key = -k;
+            if (key == KEY_RESIZE) { resizeUI(); continue; }
+            if (key == KEY_BACKSPACE) {
+                if (current_mode == MODE_INPUT && !current_input_string.empty())
+                {
+                    current_input_string.pop_back(); triggerGlobalUpdate();
+                }
+                continue;
+            }
+            if (key == KEY_F(2)) {
+                if (!chat_history.empty()) {
+                    current_mode = MODE_SELECT;
+                    if (selected_line_idx == -1) selected_line_idx = (int)chat_history.size() - 1;
+                    triggerGlobalUpdate();
+                }
+                continue;
+            }
+            if (key == 27) { // ESC
+                if (current_mode == MODE_SELECT) { current_mode = MODE_INPUT; triggerGlobalUpdate(); }
+                continue;
+            }
+            if (current_mode == MODE_SELECT) {
+                int cy, cx; getmaxyx(chat_win, cy, cx); (void)cx;
+                if (key == KEY_UP && selected_line_idx > 0) {
+                    --selected_line_idx;
+                    if (selected_line_idx < scroll_offset) scroll_offset = selected_line_idx;
+                    triggerGlobalUpdate();
+                }
+                else if (key == KEY_DOWN && selected_line_idx < (int)chat_history.size() - 1) {
+                    ++selected_line_idx;
+                    if (selected_line_idx >= scroll_offset + cy) scroll_offset = selected_line_idx - cy + 1;
+                    triggerGlobalUpdate();
+                }
+            }
             continue;
         }
 
-        if (input == "/online") {
-            sendCommand(CMD_REQ_ONLINE);
-            continue;
-        }
-
-        stateMutex.lock();
-        std::string current_partner = active_chat_partner;
-        std::string current_group = active_group;
-        std::string l_sender = last_msg_sender;
-        std::string l_text = last_msg_text;
-        stateMutex.unlock();
-
-        if (input == "/clear") {
-            if (!current_partner.empty()) {
-                sendCommand(CMD_CLEAR + "|PM|" + current_partner);
-            }
-            else if (!current_group.empty()) {
-                sendCommand(CMD_CLEAR + "|GROUP|" + current_group);
-            }
-            else {
-                std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: You must be inside a chat room or group to clear history." << COLOR_RESET << std::endl;
+        // Печатные символы и переводы строк (k > 0)
+        if (k == '\n') {
+            if (current_mode == MODE_INPUT && !current_input_string.empty()) {
+                handleOutboundCommand(current_input_string);
+                current_input_string.clear();
+                triggerGlobalUpdate();
             }
             continue;
         }
-
-        if (!current_partner.empty()) {
-            if (input == "/exit") {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[You left the chat with " << current_partner << "]" << COLOR_RESET << std::endl;
-                std::cout << "========================================" << std::endl;
-                stateMutex.lock();
-                active_chat_partner = "";
-                stateMutex.unlock();
-                continue;
-            }
-
-            if (input.rfind("/reply ", 0) == 0) {
-                std::string reply_payload = input.substr(7);
-                if (l_text.empty()) {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to reply to." << COLOR_RESET << std::endl;
-                    continue;
+        if (current_mode == MODE_SELECT) {
+            if (k == 'r' || k == 'R') {
+                DisplayMessage& t = chat_history[selected_line_idx];
+                if (!t.is_system) {
+                    current_input_string = L"(reply to " + t.sender + L": \"" + t.text + L"\") ";
+                    current_mode = MODE_INPUT; triggerGlobalUpdate();
                 }
-                std::string formatted = "(reply to " + l_sender + ": \"" + l_text + "\") " + reply_payload;
-                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
-                sendCommand(CMD_MSG + "|" + current_partner + "|" + formatted);
-                logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + formatted);
-                continue;
             }
-
-            if (input == "/forward") {
-                if (l_text.empty()) {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
-                    continue;
+            else if (k == 'f' || k == 'F') {
+                DisplayMessage& t = chat_history[selected_line_idx];
+                if (has_forward_buffer) {
+                    stateMutex.lock(); std::wstring fcp = active_chat_partner, fcg = active_group; stateMutex.unlock();
+                    std::wstring fmt = L"(fwd from " + forward_buffer.sender + L"): " + forward_buffer.text;
+                    pushMessageToHistory(my_username, fmt);
+                    if (!fcp.empty()) sendCommand(CMD_MSG + "|" + to_string(fcp) + "|" + to_string(fmt));
+                    else if (!fcg.empty()) sendCommand(CMD_GROUP_MSG + "|" + to_string(fcg) + "|" + to_string(fmt));
+                    has_forward_buffer = false; current_mode = MODE_INPUT;
+                    pushMessageToHistory(L"System", L"[Buffer]: Forwarded!", true, 2);
                 }
-                std::string formatted = "(fwd from " + l_sender + "): " + l_text;
-                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
-                sendCommand(CMD_MSG + "|" + current_partner + "|" + formatted);
-                logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + formatted);
-                continue;
+                else if (!t.is_system) {
+                    forward_buffer = t; has_forward_buffer = true;
+                    pushMessageToHistory(L"System", L"[Buffer]: Copied. Go to chat, press F2 -> F.", true, 2);
+                    current_mode = MODE_INPUT;
+                }
+                triggerGlobalUpdate();
             }
-
-            std::cout << "\033[A\r\033[K[" << my_username << "]: " << input << std::endl;
-            sendCommand(CMD_MSG + "|" + current_partner + "|" + input);
-            logMessage(CLIENT_LOG, "OUT", "To " + current_partner + ": " + input);
+            continue;
         }
-        else if (!current_group.empty()) {
-            if (input == "/exit") {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "[You left the group context " << current_group << "]" << COLOR_RESET << std::endl;
-                std::cout << "========================================" << std::endl;
-                stateMutex.lock();
-                active_group = "";
-                stateMutex.unlock();
-                continue;
-            }
-            if (input.rfind("/add ", 0) == 0) {
-                std::string target = input.substr(5);
-                sendCommand(CMD_GROUP_ADD + "|" + current_group + "|" + target);
-                continue;
-            }
-            if (input.rfind("/delete ", 0) == 0) {
-                std::string target = input.substr(8);
-                sendCommand(CMD_GROUP_KICK + "|" + current_group + "|" + target);
-                continue;
-            }
-            if (input == "/delete_group") {
-                sendCommand(CMD_GROUP_DEL + "|" + current_group);
-                continue;
-            }
-
-            if (input.rfind("/reply ", 0) == 0) {
-                std::string reply_payload = input.substr(7);
-                if (l_text.empty()) {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to reply to." << COLOR_RESET << std::endl;
-                    continue;
-                }
-                std::string formatted = "(reply to " + l_sender + ": \"" + l_text + "\") " + reply_payload;
-                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
-                sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + formatted);
-                logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + formatted);
-                continue;
-            }
-
-            if (input == "/forward") {
-                if (l_text.empty()) {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: No message available to forward." << COLOR_RESET << std::endl;
-                    continue;
-                }
-                std::string formatted = "(fwd from " + l_sender + "): " + l_text;
-                std::cout << "\033[A\r\033[K[" << my_username << "]: " << formatted << std::endl;
-                sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + formatted);
-                logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + formatted);
-                continue;
-            }
-
-            std::cout << "\033[A\r\033[K[" << my_username << "]: " << input << std::endl;
-            sendCommand(CMD_GROUP_MSG + "|" + current_group + "|" + input);
-            logMessage(CLIENT_LOG, "G_OUT", "[" + current_group + "] " + input);
-        }
-        else {
-            if (input.rfind("/chat ", 0) == 0) {
-                std::string target = input.substr(6);
-                if (target == my_username) continue;
-                stateMutex.lock();
-                active_chat_partner = target;
-                stateMutex.unlock();
-                std::cout << "\033[A\r\033[K\n========================================\n Chat with: " << target << "\n========================================\nType /exit to leave\n" << std::endl;
-
-                sendCommand(CMD_REQ_HISTORY + "|PM|" + target);
-            }
-            else if (input.rfind("/group ", 0) == 0) {
-                std::string gname = input.substr(7);
-                if (gname.empty() || gname[0] != '#') {
-                    std::cout << "\033[A\r\033[K" << COLOR_RED << "[Error]: Group name must start with '#'" << COLOR_RESET << std::endl;
-                    continue;
-                }
-
-                std::cout << "\033[A\r\033[K" << std::flush;
-                stateMutex.lock();
-                pending_group = gname;
-                stateMutex.unlock();
-
-                sendCommand(CMD_GROUP_JOIN + "|" + gname);
-            }
-            else {
-                std::cout << "\033[A\r\033[K" << COLOR_YELLOW << "Use: /chat <name>, /group <#name>, /online or /help" << COLOR_RESET << std::endl;
-            }
+        // Обычный печатный ввод (MODE_INPUT)
+        if (k >= 32) {
+            current_input_string.push_back((wchar_t)k);
+            triggerGlobalUpdate();
         }
     }
 
-    rl_cleanup_after_signal();
-    if (ssl_conn) {
-        SSL_shutdown(ssl_conn);
-        SSL_free(ssl_conn);
-    }
-    closesocket(sock);
-    if (client_ctx) SSL_CTX_free(client_ctx);
+    // --- Завершение работы программы ---
     if (recv_thread.joinable()) recv_thread.join();
+    delwin(header_win); delwin(chat_win); delwin(input_win);
+    endwin();
+    if (ssl_conn) { SSL_shutdown(ssl_conn); SSL_free(ssl_conn); }
+    if (client_ctx)   SSL_CTX_free(client_ctx);
+    if (sock != INVALID_SOCKET) closesocket(sock);
     cleanupNetwork();
     return 0;
 }
