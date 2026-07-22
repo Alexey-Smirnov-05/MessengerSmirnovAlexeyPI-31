@@ -16,34 +16,42 @@
 #include <openssl/ssl.h> // Главная библиотека OpenSSL для безопасного соединения
 #include <openssl/err.h> // Для получения расшифровки ошибок OpenSSL
 
-#include "common.h"      // Твой кастомный файл с общими макросами (CMD_LOGIN, DEFAULT_PORT, SOCKET и т.д.)
+#include "common.h"      // Твой кастомный файл с общими макросами
 #include "logger.h"      // Твой кастомный файл с функцией логирования logMessage
 
 namespace fs = std::filesystem; // Глобальные пространства имен и константы
 
-const std::string SERVER_LOG = "server.log";
-const std::string GROUPS_CONFIG_FILE = "groups_config.txt";
+const std::string SERVER_LOG = "logs/server.log";
+const std::string GROUPS_CONFIG_FILE = "groups/groups_config.txt";
+
+// Гарантируем наличие новых макросов
+#ifndef CMD_REQ_GROUP_USERS
+#  define CMD_REQ_GROUP_USERS "REQ_GROUP_USERS"
+#endif
+#ifndef CMD_LIST_GROUP_USERS
+#  define CMD_LIST_GROUP_USERS "LIST_GROUP_USERS"
+#endif
 
 // Структуры данных и глобальное состояние сервера
 struct ClientInfo {
-    std::string username; // имя пользователя (сначала пустое, заполняется после авторизации)
-    SSL* ssl; // указатель на SSL-структуру OpenSSL, через которую идет шифрованный обмен данными с этим клиентом.
+    std::string username; // имя пользователя
+    SSL* ssl;             // указатель на SSL-структуру OpenSSL
 };
 
-std::map<SOCKET, ClientInfo> clients; // clients — глобальный ассоциативный массив (карта). Ключом является дескриптор сокета (SOCKET), а значением — структура ClientInfo.
+std::map<SOCKET, ClientInfo> clients; // Ассоциативный массив подключенных клиентов
 
-// Group — структура для описания чат - группы.
+// Group — структура для описания чат-группы.
 struct Group {
     std::string admin;
     std::set<std::string> members;
 };
-std::map<std::string, Group> groups; // stateMtx — объект мьютекса.
+std::map<std::string, Group> groups;
 
 std::mutex stateMtx;
-volatile sig_atomic_t server_running = 1; // флаг работы сервера. Если 1 — сервер работает.
-volatile sig_atomic_t reload_config = 0; // гарантирует, что переменная будет безопасно изменена внутри обработчиков системных сигналов.
-SOCKET server_fd = INVALID_SOCKET; // server_fd — главный слушающий сокет сервера. Через него сервер принимает новые входящие подключения.
-SSL_CTX* server_ctx = nullptr; // server_ctx — указатель на контекст OpenSSL. В нем хранятся настройки шифрования, сертификаты и приватный ключ сервера.
+volatile sig_atomic_t server_running = 1; // флаг работы сервера.
+volatile sig_atomic_t reload_config = 0;
+SOCKET server_fd = INVALID_SOCKET;        // Главный слушающий сокет сервера
+SSL_CTX* server_ctx = nullptr;            // Указатель на контекст OpenSSL
 
 void handle_sigint(int) {
     server_running = 0;
@@ -58,16 +66,26 @@ void handle_sighup(int) {
 }
 #endif
 
-std::string getPMFilename(std::string u1, std::string u2) {
-    if (u1 > u2) std::swap(u1, u2);
-    return "history_pm_" + u1 + "_" + u2 + ".txt";
+// Функция очистки имен файлов (защита от directory traversal)
+std::string sanitizeForFilename(std::string name) {
+    std::replace(name.begin(), name.end(), '/', '_');
+    std::replace(name.begin(), name.end(), '\\', '_');
+    return name;
 }
 
+// Теперь файлы истории ЛС хранятся строго в папке chats/
+std::string getPMFilename(std::string u1, std::string u2) {
+    if (u1 > u2) std::swap(u1, u2);
+    return "chats/history_pm_" + sanitizeForFilename(u1) + "_" + sanitizeForFilename(u2) + ".txt";
+}
+
+// Теперь файлы истории Групп хранятся строго в папке chats/
 std::string getGroupFilename(std::string gname) {
-    if (!gname.empty() && gname[0] == '#') {
-        return "history_group_" + gname.substr(1) + ".txt";
+    std::string clean = sanitizeForFilename(gname);
+    if (!clean.empty() && clean[0] == '#') {
+        return "chats/history_group_" + clean.substr(1) + ".txt";
     }
-    return "history_group_" + gname + ".txt";
+    return "chats/history_group_" + clean + ".txt";
 }
 
 void saveGroupsConfig() {
@@ -135,7 +153,7 @@ void sendPMHistoryToClient(SSL* ssl, const std::string& u1, const std::string& u
     if (!f.is_open()) return;
     std::string line;
     while (std::getline(f, line)) {
-        if (!line.empty()) sendToClient(ssl, CMD_HIST_LINE + "|PM|" + line);
+        if (!line.empty()) sendToClient(ssl, std::string(CMD_HIST_LINE) + "|PM|" + line);
     }
 }
 
@@ -144,7 +162,7 @@ void sendGroupHistoryToClient(SSL* ssl, const std::string& gname) {
     if (!f.is_open()) return;
     std::string line;
     while (std::getline(f, line)) {
-        if (!line.empty()) sendToClient(ssl, CMD_HIST_LINE + "|GROUP|" + gname + "|" + line);
+        if (!line.empty()) sendToClient(ssl, std::string(CMD_HIST_LINE) + "|GROUP|" + gname + "|" + line);
     }
 }
 
@@ -166,11 +184,11 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             }
         }
         if (nameExists) {
-            sendToClient(ssl, CMD_ERROR + "|Username already taken");
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Username already taken");
         }
         else {
             clients[client_sock].username = name;
-            sendToClient(ssl, CMD_OK + "|Logged in as " + name);
+            sendToClient(ssl, std::string(CMD_OK) + "|Logged in as " + name);
             logMessage(SERVER_LOG, "INFO", "User " + name + " connected securely");
             std::cout << "[Server] User " << name << " connected securely" << std::endl;
         }
@@ -180,7 +198,7 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
         stateMtx.lock();
         std::string name = clients[client_sock].username;
         stateMtx.unlock();
-        sendToClient(ssl, CMD_OK + "|Goodbye!");
+        sendToClient(ssl, std::string(CMD_OK) + "|Goodbye!");
         logMessage(SERVER_LOG, "INFO", "User " + name + " requested disconnect (QUIT)");
     }
     else if (cmd == CMD_REQ_ONLINE) {
@@ -195,7 +213,29 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             }
         }
         stateMtx.unlock();
-        sendToClient(ssl, CMD_ONLINE_LIST + "|" + online_list);
+        sendToClient(ssl, std::string(CMD_ONLINE_LIST) + "|" + online_list);
+    }
+    else if (cmd == CMD_REQ_GROUP_USERS || cmd == "REQ_GROUP_USERS") {
+        std::string req_group;
+        std::getline(iss, req_group);
+        if (!req_group.empty() && req_group.back() == '\r') req_group.pop_back();
+
+        stateMtx.lock();
+        if (groups.find(req_group) != groups.end()) {
+            std::stringstream ss;
+            ss << CMD_LIST_GROUP_USERS << "|";
+            bool firstUser = true;
+            for (const auto& member : groups[req_group].members) {
+                if (!firstUser) ss << ",";
+                ss << member;
+                firstUser = false;
+            }
+            sendToClient(ssl, ss.str());
+        }
+        else {
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Group not found");
+        }
+        stateMtx.unlock();
     }
     else if (cmd == CMD_CLEAR) {
         std::string type, target;
@@ -208,9 +248,9 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
 
         if (type == "PM") {
             std::string filename = getPMFilename(sender, target);
-            fs::remove(filename); // Кроссплатформенное удаление файла истории
+            fs::remove(filename);
             logMessage(SERVER_LOG, "INFO", "User " + sender + " cleared PM history with " + target);
-            sendToClient(ssl, CMD_OK + "|Private chat history cleared.");
+            sendToClient(ssl, std::string(CMD_OK) + "|Private chat history cleared.");
         }
         else if (type == "GROUP") {
             stateMtx.lock();
@@ -219,23 +259,23 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
 
             if (isAdmin) {
                 std::string filename = getGroupFilename(target);
-                fs::remove(filename); // Кроссплатформенное удаление файла истории
+                fs::remove(filename);
                 logMessage(SERVER_LOG, "GROUP", "Admin " + sender + " cleared history for group " + target);
 
-                sendToClient(ssl, CMD_OK + "|Group chat history cleared.");
+                sendToClient(ssl, std::string(CMD_OK) + "|Group chat history cleared.");
 
                 stateMtx.lock();
                 for (const auto& member : groups[target].members) {
                     for (auto& c : clients) {
                         if (c.second.username == member) {
-                            sendToClient(c.second.ssl, CMD_GROUP_MSG + "|" + target + "|Server|Chat history was cleared by admin.");
+                            sendToClient(c.second.ssl, std::string(CMD_GROUP_MSG) + "|" + target + "|Server|Chat history was cleared by admin.");
                         }
                     }
                 }
                 stateMtx.unlock();
             }
             else {
-                sendToClient(ssl, CMD_ERROR + "|Access denied: Only group admin can clear group history.");
+                sendToClient(ssl, std::string(CMD_ERROR) + "|Access denied: Only group admin can clear group history.");
             }
         }
     }
@@ -247,8 +287,10 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
         stateMtx.lock();
         std::string sender = clients[client_sock].username;
 
-        appendPMHistory(sender, target, sender, msg);
-        logMessage(SERVER_LOG, "MSG", "Private: " + sender + " -> " + target + ": " + msg);
+        if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") == std::string::npos) {
+            appendPMHistory(sender, target, sender, msg);
+            logMessage(SERVER_LOG, "MSG", "Private: " + sender + " -> " + target + ": " + msg);
+        }
 
         SSL* target_ssl = nullptr;
         for (auto& p : clients) {
@@ -258,11 +300,15 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             }
         }
         if (target_ssl == nullptr) {
-            sendToClient(ssl, CMD_OK + "|Message saved (User is offline)");
+            if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") == std::string::npos) {
+                sendToClient(ssl, std::string(CMD_OK) + "|Message saved (User is offline)");
+            }
         }
         else {
-            sendToClient(target_ssl, CMD_INMSG + "|" + sender + "|" + msg);
-            sendToClient(ssl, CMD_OK + "|Message sent");
+            sendToClient(target_ssl, std::string(CMD_INMSG) + "|" + sender + "|" + msg);
+            if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") == std::string::npos) {
+                sendToClient(ssl, std::string(CMD_OK) + "|Message sent");
+            }
         }
         stateMtx.unlock();
     }
@@ -278,6 +324,9 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
         if (type == "PM") {
             sendPMHistoryToClient(ssl, sender, target);
         }
+        else if (type == "GROUP") {
+            sendGroupHistoryToClient(ssl, target);
+        }
     }
     else if (cmd == CMD_GROUP_JOIN) {
         std::string group_name;
@@ -292,18 +341,18 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             groups[group_name] = g;
             saveGroupsConfig();
 
-            sendToClient(ssl, CMD_OK + "|Group created. You are admin.");
+            sendToClient(ssl, std::string(CMD_OK) + "|Group created. You are admin.");
             logMessage(SERVER_LOG, "GROUP", sender + " created group " + group_name);
             sendGroupHistoryToClient(ssl, group_name);
         }
         else {
             if (groups[group_name].members.count(sender)) {
-                sendToClient(ssl, CMD_OK + "|Joined group.");
+                sendToClient(ssl, std::string(CMD_OK) + "|Joined group.");
                 logMessage(SERVER_LOG, "GROUP", sender + " entered group " + group_name);
                 sendGroupHistoryToClient(ssl, group_name);
             }
             else {
-                sendToClient(ssl, CMD_ERROR + "|Access denied: You are not a member of this group. Admin must add you.");
+                sendToClient(ssl, std::string(CMD_ERROR) + "|Access denied: You are not a member of this group. Admin must add you.");
             }
         }
         stateMtx.unlock();
@@ -316,19 +365,21 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
         stateMtx.lock();
         std::string sender = clients[client_sock].username;
         if (groups.find(group_name) != groups.end() && groups[group_name].members.count(sender)) {
-            appendGroupHistory(group_name, sender, msg);
-            logMessage(SERVER_LOG, "GMSG", "[" + group_name + "] " + sender + ": " + msg);
+            if (msg.find("_SYSTEM_CHAT_CLEAR_REQUEST_") == std::string::npos) {
+                appendGroupHistory(group_name, sender, msg);
+                logMessage(SERVER_LOG, "GMSG", "[" + group_name + "] " + sender + ": " + msg);
+            }
 
             for (const auto& member : groups[group_name].members) {
                 for (auto& c : clients) {
                     if (c.second.username == member && c.first != client_sock) {
-                        sendToClient(c.second.ssl, CMD_GROUP_MSG + "|" + group_name + "|" + sender + "|" + msg);
+                        sendToClient(c.second.ssl, std::string(CMD_GROUP_MSG) + "|" + group_name + "|" + sender + "|" + msg);
                     }
                 }
             }
         }
         else {
-            sendToClient(ssl, CMD_ERROR + "|Access denied or group not found");
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Access denied or group not found");
         }
         stateMtx.unlock();
     }
@@ -343,18 +394,20 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             groups[group_name].members.insert(target);
             saveGroupsConfig();
 
-            sendToClient(ssl, CMD_OK + "|User " + target + " added.");
+            sendToClient(ssl, std::string(CMD_OK) + "|User " + target + " added.");
             logMessage(SERVER_LOG, "GROUP", sender + " added " + target + " to " + group_name);
 
-            for (auto& c : clients) {
-                if (c.second.username == target) {
-                    sendToClient(c.second.ssl, CMD_GROUP_NOTIFY + "|ADDED|" + group_name + "|" + sender);
-                    break;
+            // БРОДКАСТ ВСЕМ: Оповещаем всех участников, что был добавлен новый пользователь
+            for (const auto& member : groups[group_name].members) {
+                for (auto& c : clients) {
+                    if (c.second.username == member) {
+                        sendToClient(c.second.ssl, std::string(CMD_GROUP_NOTIFY) + "|ADDED|" + group_name + "|" + sender + "|" + target);
+                    }
                 }
             }
         }
         else {
-            sendToClient(ssl, CMD_ERROR + "|Only admin can add members");
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Only admin can add members");
         }
         stateMtx.unlock();
     }
@@ -369,22 +422,31 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             if (groups[group_name].members.erase(target)) {
                 saveGroupsConfig();
 
-                sendToClient(ssl, CMD_OK + "|User " + target + " deleted.");
+                sendToClient(ssl, std::string(CMD_OK) + "|User " + target + " deleted.");
                 logMessage(SERVER_LOG, "GROUP", sender + " kicked " + target + " from " + group_name);
 
+                // Оповещаем оставшихся участников о кике
+                for (const auto& member : groups[group_name].members) {
+                    for (auto& c : clients) {
+                        if (c.second.username == member) {
+                            sendToClient(c.second.ssl, std::string(CMD_GROUP_NOTIFY) + "|KICKED|" + group_name + "|" + sender + "|" + target);
+                        }
+                    }
+                }
+                // Отдельно оповещаем исключенного, чтобы у него вывелось предупреждение и закрылся чат
                 for (auto& c : clients) {
                     if (c.second.username == target) {
-                        sendToClient(c.second.ssl, CMD_GROUP_NOTIFY + "|KICKED|" + group_name + "|" + sender);
+                        sendToClient(c.second.ssl, std::string(CMD_GROUP_NOTIFY) + "|KICKED|" + group_name + "|" + sender + "|" + target);
                         break;
                     }
                 }
             }
             else {
-                sendToClient(ssl, CMD_ERROR + "|User not in group");
+                sendToClient(ssl, std::string(CMD_ERROR) + "|User not in group");
             }
         }
         else {
-            sendToClient(ssl, CMD_ERROR + "|Only admin can delete members");
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Only admin can delete members");
         }
         stateMtx.unlock();
     }
@@ -398,7 +460,7 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             for (const auto& member : groups[group_name].members) {
                 for (auto& c : clients) {
                     if (c.second.username == member) {
-                        sendToClient(c.second.ssl, CMD_GROUP_NOTIFY + "|DELETED|" + group_name);
+                        sendToClient(c.second.ssl, std::string(CMD_GROUP_NOTIFY) + "|DELETED|" + group_name + "|" + sender + "|*");
                     }
                 }
             }
@@ -406,11 +468,11 @@ void processClientCommand(SOCKET client_sock, SSL* ssl, const std::string& data)
             saveGroupsConfig();
             fs::remove(getGroupFilename(group_name));
 
-            sendToClient(ssl, CMD_OK + "|Group deleted.");
+            sendToClient(ssl, std::string(CMD_OK) + "|Group deleted.");
             logMessage(SERVER_LOG, "GROUP", sender + " deleted group " + group_name);
         }
         else {
-            sendToClient(ssl, CMD_ERROR + "|Only admin can delete the group");
+            sendToClient(ssl, std::string(CMD_ERROR) + "|Only admin can delete the group");
         }
         stateMtx.unlock();
     }
@@ -467,6 +529,11 @@ void handleClient(SOCKET client_sock) {
 }
 
 int main() {
+    // Автоматическое создание всех необходимых директорий при первом запуске
+    if (!fs::exists("logs")) fs::create_directory("logs");
+    if (!fs::exists("chats")) fs::create_directory("chats");
+    if (!fs::exists("groups")) fs::create_directory("groups");
+
     if (!initNetwork()) {
         std::cerr << "Failed to init network architecture." << std::endl;
         return 1;
@@ -486,6 +553,7 @@ int main() {
         return 1;
     }
 
+    // Восстановленный inline блок настройки сертификатов SSL (без внешних функций)
     if (SSL_CTX_use_certificate_file(server_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file(server_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
         std::cerr << "SSL Certificates error." << std::endl;
@@ -528,7 +596,8 @@ int main() {
         return 1;
     }
 
-    logMessage(SERVER_LOG, "INFO", "Secure Server started on port " + std::to_string(DEFAULT_PORT));
+    // Исправлено логирование с использованием std::to_string
+    logMessage(SERVER_LOG, "INFO", "Server started on port " + std::to_string(DEFAULT_PORT));
     std::cout << "[Server] Secure TLS Listening on port " << DEFAULT_PORT << std::endl;
 
     while (server_running) {
@@ -551,14 +620,13 @@ int main() {
             reload_config = 0;
         }
 
-        // Запускаем стандартный кроссплатформенный std::thread вместо pthread
         std::thread(handleClient, client_sock).detach();
     }
 
     stateMtx.lock();
     logMessage(SERVER_LOG, "INFO", "Broadcasting termination notification sequence.");
     for (auto& p : clients) {
-        sendToClient(p.second.ssl, CMD_ERROR + "|Server is down");
+        sendToClient(p.second.ssl, std::string(CMD_ERROR) + "|Server is down");
         SSL_shutdown(p.second.ssl);
         SSL_free(p.second.ssl);
         closesocket(p.first);
